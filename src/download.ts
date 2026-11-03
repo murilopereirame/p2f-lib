@@ -14,6 +14,9 @@
  *     CTR is seekable, so a whole local file is always a correct prefix of
  *     the plaintext and the resume is safe.
  *   - A finished file is checked against the server's plaintext SHA-256.
+ *     If it does not match, it heals itself: the pieces that are missing or
+ *     damaged are found and fetched again on their own (repair.ts), instead
+ *     of the whole file.
  *
  * The remote data is never changed. This client only reads.
  */
@@ -31,8 +34,11 @@ import {
   generateClientKeyPair,
   unwrapTransferKey,
 } from "./crypto.js";
+import { repairFile, webseedFetcher } from "./repair.js";
+import type { RepairProgress, RepairResult } from "./repair.js";
 import { P2FError } from "./types.js";
-import type { ClientKeyPair } from "./crypto.js";
+import type { ClientKeyPair, TransferKey } from "./crypto.js";
+import type { TorrentMeta } from "./types.js";
 
 export interface Transfer {
   bytesDone: number;
@@ -48,9 +54,16 @@ export interface DownloadOptions {
   /** Abort the whole download (a pause or a shutdown). The bytes on disk are
    * kept and a later call resumes from them. */
   signal?: AbortSignal;
-  /** Check each finished file against the server's plaintext SHA-256.
-   * Default true. */
+  /** Check each finished file against the server's plaintext SHA-256, and
+   * check a file already on disk at full size before it is skipped. Default
+   * true. */
   verify?: boolean;
+  /** When a file fails the checksum, fetch only its missing or damaged
+   * pieces again instead of the whole file. Needs `verify`. Default true. */
+  repair?: boolean;
+  /** Progress of a repair, per file (the path under the local target, or the
+   * file name for a single-file download). */
+  onRepair?: (file: string, progress: RepairProgress) => void;
   /** Destroy a stalled connection after this many ms with no bytes, so the
    * caller's retry can resume it. Default 60000. Zero turns it off. */
   idleTimeoutMs?: number;
@@ -180,6 +193,37 @@ async function fileSha256(target: string): Promise<string> {
 }
 
 /**
+ * Heal a local file that failed its checksum: fetch only the missing or
+ * damaged pieces again (repair.ts), then check the whole file again. Returns
+ * true if it now matches. A failed repair leaves the file for the caller.
+ */
+async function healFile(
+  client: P2FClient,
+  file: RemoteFile,
+  local: string,
+  meta: TorrentMeta,
+  transferKey: TransferKey,
+  opts: DownloadOptions,
+): Promise<RepairResult | null> {
+  const name = file.relative || path.basename(local);
+  try {
+    const result = await repairFile(
+      local,
+      Buffer.from(meta.torrentBase64, "base64"),
+      transferKey.key,
+      transferKey.iv,
+      webseedFetcher(client, file.remote),
+      { signal: opts.signal, onProgress: (p) => opts.onRepair?.(name, p) },
+    );
+    return (await fileSha256(local)) === meta.plainSha256 ? result : null;
+  } catch (err) {
+    // A pause or shutdown is not a failed repair: keep the bytes and stop.
+    if (opts.signal?.aborted) throw err;
+    return null;
+  }
+}
+
+/**
  * Download one file into `local`, resuming from whatever is on disk. Returns
  * the new running byte total (`base` plus this file's size).
  */
@@ -195,6 +239,7 @@ async function downloadFile(
 ): Promise<number> {
   const onProgress = opts.onProgress;
   const verify = opts.verify ?? true;
+  const repair = verify && (opts.repair ?? true);
   const idleTimeoutMs = opts.idleTimeoutMs ?? 60_000;
 
   const existing = await localSize(local);
@@ -203,9 +248,25 @@ async function downloadFile(
   // key, and the checksum. It is cheap (cached server-side after the first).
   const meta = await client.torrentMeta(file.remote, keyPair.clientPublicKeyBase64);
   const length = meta.length;
-  const { key, iv } = unwrapTransferKey(keyPair.ecdh, serverPublicKeyBase64, meta.encKeyWrapped);
+  const transferKey = unwrapTransferKey(keyPair.ecdh, serverPublicKeyBase64, meta.encKeyWrapped);
+  const { key, iv } = transferKey;
 
   const plan = planResume(existing, length);
+
+  // A full-size file can still be wrong inside (a bad disk write, a copy
+  // that was cut and padded). Check it before trusting it, and heal it if
+  // it is wrong.
+  if (plan.skip && verify && meta.plainSha256 && length > 0) {
+    if ((await fileSha256(local)) !== meta.plainSha256) {
+      if (!repair || !(await healFile(client, file, local, meta, transferKey, opts))) {
+        await rm(local, { force: true });
+        throw new Error(
+          `the file '${file.relative || path.basename(local)}' on disk failed the checksum. ` +
+            `It was removed and will be downloaded again.`,
+        );
+      }
+    }
+  }
 
   if (plan.skip) {
     transfer.bytesDone = base + length;
@@ -290,8 +351,9 @@ async function downloadFile(
 
   if (verify && meta.plainSha256) {
     const got = await fileSha256(local);
-    if (got !== meta.plainSha256) {
-      // The bytes are wrong end to end. Drop them so the next try starts clean.
+    // Wrong somewhere: fetch only the bad pieces again. If that fails too,
+    // drop the file so the next try starts clean.
+    if (got !== meta.plainSha256 && !(repair && (await healFile(client, file, local, meta, transferKey, opts)))) {
       await rm(local, { force: true });
       throw new Error(
         `the file '${file.relative || path.basename(local)}' failed the checksum. ` +

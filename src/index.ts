@@ -12,6 +12,23 @@ export { downloadPath, planResume } from "./download.js";
 export type { DownloadOptions, ProgressHandler, Transfer, ResumePlan } from "./download.js";
 
 export {
+  ctrXorAt,
+  findDamagedPieces,
+  parseTorrentLayout,
+  repairFile,
+  rewritePieces,
+  webseedFetcher,
+} from "./repair.js";
+export type {
+  FetchRange,
+  RepairOptions,
+  RepairPhase,
+  RepairProgress,
+  RepairResult,
+  TorrentLayout,
+} from "./repair.js";
+
+export {
   BLOCK_LEN,
   createCtrDecipherAt,
   ctrCounter,

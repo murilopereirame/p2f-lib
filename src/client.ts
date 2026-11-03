@@ -28,6 +28,8 @@ export interface P2FClientOptions {
 export interface RawRangeOptions {
   /** The first byte to fetch. Omit for the whole file. */
   start?: number;
+  /** The last byte to fetch (inclusive). Omit to read to the end. */
+  end?: number;
   /** Abort the stream (a pause, a stall watchdog, a shutdown). */
   signal?: AbortSignal;
 }
@@ -104,7 +106,9 @@ export class P2FClient {
    */
   async rawRange(path: string, opts: RawRangeOptions = {}): Promise<Response> {
     const headers: Record<string, string> = { ...this.authHeaders() };
-    if (opts.start !== undefined && opts.start > 0) {
+    if (opts.end !== undefined) {
+      headers["Range"] = `bytes=${opts.start ?? 0}-${opts.end}`;
+    } else if (opts.start !== undefined && opts.start > 0) {
       headers["Range"] = `bytes=${opts.start}-`;
     }
     let res: Response;
