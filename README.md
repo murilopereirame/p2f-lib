@@ -22,7 +22,11 @@ modules — and gives you the same resilience:
   unwrapped here (P-256 / HKDF-SHA256 / AES-256-GCM), then the stream is
   decrypted as it arrives. Nothing is written to disk encrypted.
 - **Verified.** A finished file is checked against the server's plaintext
-  SHA-256.
+  SHA-256, and so is a full-size file already on disk before it is skipped.
+- **Self-healing.** A file that fails the checksum is not downloaded again
+  from scratch. Each piece of it is checked against the torrent's piece
+  hashes, and only the missing or damaged pieces are fetched again (byte
+  ranges), checked, decrypted and written back in place.
 - **Pausable.** Pass an `AbortSignal`; aborting stops the transfer and keeps
   the bytes for a later resume. A built-in idle watchdog drops a stalled
   connection so a retry can pick it back up.
@@ -77,7 +81,12 @@ node src/server/cli.ts add-token <user> <name>   # prints a p2f_… token once
 - `downloadPath(client, remotePath, localDir, options?)` — the high-level
   resumable download of a file or folder. Returns the local path.
   Options: `onProgress`, `signal`, `verify` (default `true`),
+  `repair` (default `true`), `onRepair(file, { phase, done, total })`,
   `idleTimeoutMs` (default `60000`).
+- `repairFile(local, torrent, key, iv, fetchRange, options?)` — heal one
+  local file in place (what `downloadPath` uses). `webseedFetcher(client,
+  remotePath)` makes the `fetchRange`; `findDamagedPieces` and
+  `parseTorrentLayout` are the pieces of it.
 - Crypto building blocks (`generateClientKeyPair`, `unwrapTransferKey`,
   `createCtrDecipherAt`, `DropBytes`, `ctrCounter`) and the wire types, for a
   caller that wants to drive the transfer itself.
@@ -87,6 +96,6 @@ node src/server/cli.ts add-token <user> <name>   # prints a p2f_… token once
 ```sh
 npm install       # also builds via the prepare script
 npm run build     # compile to dist/
-npm test          # crypto round-trip + resume-plan tests (node:test)
+npm test          # crypto, resume-plan and self-heal tests (node:test)
 npm run typecheck # types only
 ```
