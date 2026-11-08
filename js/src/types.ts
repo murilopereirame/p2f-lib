@@ -65,3 +65,11 @@ export class P2FError extends Error {
     this.status = status;
   }
 }
+
+/** The server is still preparing a file (it reads and hashes it once). */
+export interface PrepareProgress {
+  /** Bytes of the file the server has read so far, when it says. */
+  bytesDone: number;
+  /** The file size, when the server says; else 0. */
+  bytesTotal: number;
+}

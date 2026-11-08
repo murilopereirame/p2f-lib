@@ -1,5 +1,11 @@
-node_modules/
+build/
 dist/
-dist-test/
+third_party/
+node_modules/
+js/dist/
+js/src/wasm-bytes.ts
+*.tgz
 *.log
 .DS_Store
+js/dist-test/
+toolchains/

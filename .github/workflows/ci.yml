@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build + test (desktop, PS4, WebAssembly, JS)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Cache toolchains and third-party sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchains
+            third_party
+          key: toolchains-${{ hashFiles('scripts/install_toolchains.sh', 'scripts/fetch_deps.sh') }}
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm python3-cryptography bc
+      - run: scripts/fetch_deps.sh
+      - name: Toolchains
+        run: scripts/install_toolchains.sh ps4 wasm | tee -a "$GITHUB_ENV"
+
+      - name: Desktop library + end-to-end tests
+        run: make -j"$(nproc)" test
+      - name: PS4 library
+        run: make -j"$(nproc)" ps4 PS4_AR=llvm-ar
+      - name: WebAssembly core
+        run: make -j"$(nproc)" wasm
+
+      - name: JavaScript package
+        working-directory: js
+        run: |
+          npm ci
+          npm test
+          npm pack
+
+      - name: Release bundles
+        run: make dist PS4_AR=llvm-ar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2f-lib
+          path: |
+            dist/*
+            js/*.tgz
+          if-no-files-found: error

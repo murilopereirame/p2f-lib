@@ -1,0 +1,79 @@
+# On every merge to main: build and test everything (ci.yml), then publish
+# the version in VERSION if it is not published yet:
+#   - a GitHub Release v<version> with the desktop and PS4 libraries, the
+#     WebAssembly core and the npm tarball;
+#   - the npm package @murilopereirame/p2f-lib on GitHub Packages.
+# A merge that does not change VERSION builds and tests, and publishes nothing.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: p2f-lib
+          path: out
+      - id: version
+        run: |
+          v=$(cat VERSION)
+          js=$(node -p "require('./js/package.json').version")
+          if [ "$v" != "$js" ]; then
+            echo "::error::VERSION ($v) and js/package.json ($js) differ"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$v is already released. Bump VERSION and js/package.json to publish."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: GitHub Release
+        if: steps.version.outputs.exists == 'false'
+        run: |
+          v=${{ steps.version.outputs.version }}
+          gh release create "v$v" --target "$GITHUB_SHA" --title "p2f-lib $v" \
+            --notes "Built from $GITHUB_SHA.
+
+          - \`p2f-lib-$v-ps4.tar.gz\`: PS4 (OpenOrbis) static library + header
+          - \`p2f-lib-$v-linux-x86_64.tar.gz\`: desktop static library, header, \`p2f-cli\`
+          - \`p2f-$v.wasm\`: the WebAssembly core
+          - \`murilopereirame-p2f-lib-$v.tgz\`: the JavaScript package (also on GitHub Packages)
+
+          npm: \`\"p2f-lib\": \"https://github.com/$GITHUB_REPOSITORY/releases/download/v$v/murilopereirame-p2f-lib-$v.tgz\"\`" \
+            out/dist/* out/js/*.tgz
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.exists == 'false'
+        with:
+          node-version: '22'
+          registry-url: https://npm.pkg.github.com
+          scope: '@murilopereirame'
+      - name: GitHub Packages (npm)
+        if: steps.version.outputs.exists == 'false'
+        run: npm publish out/js/murilopereirame-p2f-lib-${{ steps.version.outputs.version }}.tgz
+        env:
+          NODE_AUTH_TOKEN: ${{ github.token }}

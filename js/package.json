@@ -1,0 +1,45 @@
+{
+  "name": "@murilopereirame/p2f-lib",
+  "version": "0.2.0",
+  "description": "The peer-to-file client library for JavaScript: the p2f-lib C core compiled to WebAssembly, with a fetch-based client. Runs in Node, browsers and Electron.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/murilopereirame/p2f-lib.git",
+    "directory": "js"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "scripts": {
+    "embed": "node scripts/embed-wasm.mjs ../build/wasm/p2f.wasm src/wasm-bytes.ts",
+    "build": "npm run embed && tsc",
+    "typecheck": "npm run embed && tsc --noEmit",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
