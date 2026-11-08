@@ -1,4 +1,4 @@
-# p2f-lib: one C library, three builds.
+# p2f-lib: one C library for desktop, PS4, WebAssembly, Android and iOS.
 #
 #   make              desktop library + p2f-cli     -> build/host/
 #   make test         desktop build + end-to-end tests (needs Node 20+)
@@ -8,7 +8,13 @@
 #                     include/p2f_platform.h (P2PS: ps4/platform_ps4.c).
 #   make wasm         WebAssembly core for the JavaScript package
 #                     -> build/wasm/p2f.wasm; needs WASI_SDK_PATH=/path/to/wasi-sdk
+#   make android      Android libraries (NDK r26+)   -> build/android/<abi>/libp2f.a
+#                     for arm64-v8a, armeabi-v7a and x86_64; needs
+#                     ANDROID_NDK_HOME=/path/to/ndk
+#   make ios          iOS XCFramework (macOS + Xcode) -> build/ios/P2F.xcframework
+#                     device arm64, simulator arm64 + x86_64
 #   make dist         release bundles                -> dist/
+#                     (dist-android and dist-ios are separate targets)
 #
 # Third-party sources: scripts/fetch_deps.sh (mbedTLS, cJSON).
 
@@ -109,6 +115,63 @@ $(WASM)/%.o: %.c src/p2f_mbedtls_config_wasm.h VERSION
 	@mkdir -p $(dir $@)
 	$(WASM_CC) $(WASM_CFLAGS) -Wall -c -o $@ $<
 
+# ---- Android and iOS ----------------------------------------------------
+# Static libraries with the POSIX platform hooks (weak, so the app can
+# replace any of them; see include/p2f_platform.h).
+#
+# $(1) build dir, $(2) compiler command, $(3) archive command, $(4) flags
+define static_lib
+$(1)/libp2f.a: $(patsubst %.c,$(1)/%.o,$(CORE_SRC) src/platform/posix.c $(MBED_SRC))
+	rm -f $$@
+	$(3) $$@ $$^
+
+$(1)/$(MBEDTLS)/%.o: $(MBEDTLS)/%.c src/p2f_mbedtls_config.h
+	@mkdir -p $$(dir $$@)
+	$(2) $(4) -w -c -o $$@ $$<
+
+$(1)/%.o: %.c src/p2f_mbedtls_config.h VERSION
+	@mkdir -p $$(dir $$@)
+	$(2) $(4) -Wall -Wextra -c -o $$@ $$<
+endef
+
+MOBILE_CFLAGS := -O2 -fPIC $(INCS) $(DEFS)
+
+# Android: one library per ABI, API level 24 (Android 7.0) and up.
+ANDROID_API   ?= 24
+ANDROID_HOST  := $(if $(filter Darwin,$(shell uname -s)),darwin,linux)-x86_64
+ANDROID_BIN    = $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/$(ANDROID_HOST)/bin
+ANDROID_ABIS  := arm64-v8a armeabi-v7a x86_64
+android_triple = $(if $(filter arm64-v8a,$(1)),aarch64-linux-android,$(if $(filter armeabi-v7a,$(1)),armv7a-linux-androideabi,x86_64-linux-android))
+ANDROID_OBJ   := $(foreach a,$(ANDROID_ABIS),$(patsubst %.c,build/android/$(a)/%.o,$(CORE_SRC) src/platform/posix.c $(MBED_SRC)))
+
+android: $(foreach a,$(ANDROID_ABIS),build/android/$(a)/libp2f.a)
+
+android-check:
+	@test -n "$(ANDROID_NDK_HOME)" -a -x "$(ANDROID_BIN)/clang" || { echo "Set ANDROID_NDK_HOME to an Android NDK (r26+)"; exit 1; }
+
+$(ANDROID_OBJ): | android-check
+
+$(foreach a,$(ANDROID_ABIS),$(eval $(call static_lib,build/android/$(a),$(ANDROID_BIN)/clang,$(ANDROID_BIN)/llvm-ar rcs,--target=$(call android_triple,$(a))$(ANDROID_API) $(MOBILE_CFLAGS))))
+
+# iOS: needs macOS with Xcode. One XCFramework for device and simulator.
+IOS_MIN       ?= 13.0
+IOS_DEV_CC    := xcrun -sdk iphoneos clang -arch arm64 -mios-version-min=$(IOS_MIN)
+IOS_SIM_CC    := xcrun -sdk iphonesimulator clang -arch arm64 -arch x86_64 -mios-simulator-version-min=$(IOS_MIN)
+
+$(eval $(call static_lib,build/ios/device,$(IOS_DEV_CC),libtool -static -o,$(MOBILE_CFLAGS)))
+$(eval $(call static_lib,build/ios/simulator,$(IOS_SIM_CC),libtool -static -o,$(MOBILE_CFLAGS)))
+
+ios: build/ios/P2F.xcframework
+
+build/ios/P2F.xcframework: build/ios/device/libp2f.a build/ios/simulator/libp2f.a
+	rm -rf build/ios/P2F.xcframework build/ios/headers
+	mkdir -p build/ios/headers
+	cp include/p2f.h include/p2f_platform.h build/ios/headers/
+	xcodebuild -create-xcframework \
+	  -library build/ios/device/libp2f.a -headers build/ios/headers \
+	  -library build/ios/simulator/libp2f.a -headers build/ios/headers \
+	  -output $@
+
 # ---- Release bundles -----------------------------------------------------
 # dist/p2f-lib-<v>-<target>.tar.gz: include/p2f.h + lib/libp2f.a + licenses.
 # The archive already holds mbedTLS and cJSON: link only libp2f.a.
@@ -127,6 +190,24 @@ dist-wasm: build/wasm/p2f.wasm
 
 dist: dist-host dist-ps4 dist-wasm
 
+# dist/p2f-lib-<v>-android.tar.gz: include/ + lib/<abi>/libp2f.a
+dist-android: android
+	rm -rf build/dist/p2f-lib-android
+	mkdir -p build/dist/p2f-lib-android/include dist
+	cp include/p2f.h include/p2f_platform.h build/dist/p2f-lib-android/include/
+	for a in $(ANDROID_ABIS); do mkdir -p build/dist/p2f-lib-android/lib/$$a && cp build/android/$$a/libp2f.a build/dist/p2f-lib-android/lib/$$a/; done
+	cp LICENSE THIRD_PARTY.md VERSION build/dist/p2f-lib-android/
+	tar -C build/dist -czf dist/p2f-lib-$(VERSION)-android.tar.gz p2f-lib-android
+
+# dist/p2f-lib-<v>-ios.zip: P2F.xcframework + licenses
+dist-ios: ios
+	rm -rf build/dist/p2f-lib-ios
+	mkdir -p build/dist/p2f-lib-ios dist
+	cp -R build/ios/P2F.xcframework build/dist/p2f-lib-ios/
+	cp LICENSE THIRD_PARTY.md VERSION build/dist/p2f-lib-ios/
+	rm -f dist/p2f-lib-$(VERSION)-ios.zip
+	cd build/dist && zip -qry ../../dist/p2f-lib-$(VERSION)-ios.zip p2f-lib-ios
+
 # $(1) target name, $(2) libp2f.a, $(3) optional binary
 define bundle
 	rm -rf build/dist/p2f-lib-$(1)
@@ -141,4 +222,4 @@ endef
 clean:
 	rm -rf build dist
 
-.PHONY: all host test ps4 wasm dist dist-host dist-ps4 dist-wasm clean
+.PHONY: all host test ps4 wasm android android-check ios dist dist-host dist-ps4 dist-wasm dist-android dist-ios clean

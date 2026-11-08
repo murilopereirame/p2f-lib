@@ -1,6 +1,7 @@
-/* The platform hooks (include/p2f_platform.h) for Linux, macOS and other
- * POSIX systems: the desktop build and the tests. Console and device apps
- * provide their own. */
+/* Default platform hooks (include/p2f_platform.h) for POSIX systems:
+ * Linux, macOS, Android and iOS. They are weak symbols, so an app that
+ * defines its own version of a hook replaces the default. Console apps
+ * (the PS4) link a library without this file and provide all of them. */
 #include <stdio.h>
 #include <string.h>
 #include <netdb.h>
@@ -10,7 +11,9 @@
 
 #include "p2f_internal.h"
 
-int p2f_platform_random(void *buf, size_t len)
+#define P2F_WEAK __attribute__((weak))
+
+P2F_WEAK int p2f_platform_random(void *buf, size_t len)
 {
     FILE *f = fopen("/dev/urandom", "rb");
     size_t n;
@@ -21,7 +24,7 @@ int p2f_platform_random(void *buf, size_t len)
     return n == len ? 0 : -1;
 }
 
-int p2f_platform_resolve(const char *host, struct in_addr *out,
+P2F_WEAK int p2f_platform_resolve(const char *host, struct in_addr *out,
                          char *err, size_t errlen)
 {
     struct addrinfo hints, *res = NULL;
@@ -39,7 +42,7 @@ int p2f_platform_resolve(const char *host, struct in_addr *out,
     return 0;
 }
 
-void p2f_platform_sleep_ms(int ms)
+P2F_WEAK void p2f_platform_sleep_ms(int ms)
 {
     struct timespec ts;
     if (ms <= 0)
@@ -50,7 +53,7 @@ void p2f_platform_sleep_ms(int ms)
         ;
 }
 
-uint64_t p2f_platform_now_ms(void)
+P2F_WEAK uint64_t p2f_platform_now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

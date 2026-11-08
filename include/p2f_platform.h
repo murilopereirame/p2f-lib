@@ -1,7 +1,10 @@
 /*
- * The platform hooks of p2f-lib. The library calls these and does not
- * define them for any console or device: each app (or src/platform/posix.c
- * for desktop builds) provides them. The PS4 ones live in the P2PS repo.
+ * The platform hooks of p2f-lib. The library calls these.
+ *   - PS4: the library has none; the app provides all four (P2PS:
+ *     ps4/platform_ps4.c).
+ *   - Desktop, Android, iOS: the library has POSIX defaults
+ *     (src/platform/posix.c). They are weak, so an app can replace any of
+ *     them by defining it.
  */
 #ifndef P2F_PLATFORM_H
 #define P2F_PLATFORM_H

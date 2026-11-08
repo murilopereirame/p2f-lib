@@ -55,3 +55,57 @@ jobs:
             dist/*
             js/*.tgz
           if-no-files-found: error
+
+  android:
+    name: Android libraries (NDK)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache third-party sources
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: third-party-${{ hashFiles('scripts/fetch_deps.sh') }}
+      - run: scripts/fetch_deps.sh
+      # The runner image has the NDK installed; ANDROID_NDK_LATEST_HOME is it.
+      - name: Android libraries (arm64-v8a, armeabi-v7a, x86_64)
+        run: make -j"$(nproc)" dist-android ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+      - name: Check the archives
+        run: |
+          for a in arm64-v8a armeabi-v7a x86_64; do
+            "$ANDROID_NDK_LATEST_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm build/android/$a/libp2f.a \
+              | grep -q ' T p2f_download_path$'
+            "$ANDROID_NDK_LATEST_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm build/android/$a/libp2f.a \
+              | grep -q ' W p2f_platform_random$'
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2f-lib-android
+          path: dist/*
+          if-no-files-found: error
+
+  ios:
+    name: iOS XCFramework
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache third-party sources
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: third-party-${{ hashFiles('scripts/fetch_deps.sh') }}
+      - run: scripts/fetch_deps.sh
+      - name: iOS XCFramework (device arm64, simulator arm64 + x86_64)
+        run: make -j"$(sysctl -n hw.ncpu)" dist-ios
+      - name: Check the libraries
+        run: |
+          lipo -info build/ios/device/libp2f.a build/ios/simulator/libp2f.a
+          nm build/ios/device/libp2f.a | grep -q ' T _p2f_download_path$'
+          ls build/ios/P2F.xcframework
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p2f-lib-ios
+          path: dist/*
+          if-no-files-found: error

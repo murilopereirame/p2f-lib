@@ -1,7 +1,7 @@
 # On every merge to main: build and test everything (ci.yml), then publish
 # the version in VERSION if it is not published yet:
-#   - a GitHub Release v<version> with the desktop and PS4 libraries, the
-#     WebAssembly core and the npm tarball;
+#   - a GitHub Release v<version> with the desktop, PS4, Android and iOS
+#     libraries, the WebAssembly core and the npm tarball;
 #   - the npm package @murilopereirame/p2f-lib on GitHub Packages.
 # A merge that does not change VERSION builds and tests, and publishes nothing.
 name: Release
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: p2f-lib
+          pattern: p2f-lib*
           path: out
       - id: version
         run: |
@@ -58,11 +58,13 @@ jobs:
 
           - \`p2f-lib-$v-ps4.tar.gz\`: PS4 (OpenOrbis) static library + header
           - \`p2f-lib-$v-linux-x86_64.tar.gz\`: desktop static library, header, \`p2f-cli\`
+          - \`p2f-lib-$v-android.tar.gz\`: Android static libraries (arm64-v8a, armeabi-v7a, x86_64; API 24+) + headers
+          - \`p2f-lib-$v-ios.zip\`: \`P2F.xcframework\` (iOS 13+ device and simulator)
           - \`p2f-$v.wasm\`: the WebAssembly core
           - \`murilopereirame-p2f-lib-$v.tgz\`: the JavaScript package (also on GitHub Packages)
 
           npm: \`\"p2f-lib\": \"https://github.com/$GITHUB_REPOSITORY/releases/download/v$v/murilopereirame-p2f-lib-$v.tgz\"\`" \
-            out/dist/* out/js/*.tgz
+            $(find out -type f \( -name "p2f-*" -o -name "*.tgz" \))
         env:
           GH_TOKEN: ${{ github.token }}
 
@@ -74,6 +76,6 @@ jobs:
           scope: '@murilopereirame'
       - name: GitHub Packages (npm)
         if: steps.version.outputs.exists == 'false'
-        run: npm publish out/js/murilopereirame-p2f-lib-${{ steps.version.outputs.version }}.tgz
+        run: npm publish "$(find out -type f -name "murilopereirame-p2f-lib-${{ steps.version.outputs.version }}.tgz")"
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}

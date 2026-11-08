@@ -65,6 +65,15 @@ static void set_timeout(int fd, int ms)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
+/* A write to a socket the server closed raises SIGPIPE, which ends the app
+ * on Android and iOS. Linux (and Android) take a per-call flag; Apple
+ * systems a socket option (set in connect below). */
+#if defined(__linux__)
+#define P2F_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define P2F_SEND_FLAGS 0
+#endif
+
 /* ---- Socket I/O for mbedTLS (blocking socket with timeouts) ----------- */
 
 static int bio_send(void *ctx, const unsigned char *buf, size_t len)
@@ -72,7 +81,7 @@ static int bio_send(void *ctx, const unsigned char *buf, size_t len)
     int fd = *(int *)ctx;
     ssize_t n;
     do {
-        n = send(fd, buf, len, 0);
+        n = send(fd, buf, len, P2F_SEND_FLAGS);
     } while (n < 0 && errno == EINTR);
     if (n < 0)
         return (errno == EPIPE || errno == ECONNRESET)
@@ -103,7 +112,7 @@ static int send_all(p2f_http *h, const char *buf, size_t len)
                 continue;
             n = r;
         } else {
-            n = send(h->fd, buf, len, 0);
+            n = send(h->fd, buf, len, P2F_SEND_FLAGS);
             if (n < 0 && errno == EINTR)
                 continue;
         }
@@ -258,6 +267,9 @@ int p2f_http_get(p2f_client *c, const char *path_query, int64_t range_start,
         return p2f_fail(c, P2F_ERR_NET, "socket failed (errno %d)", errno);
     set_timeout(h->fd, timeout_ms);
     setsockopt(h->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#if defined(__APPLE__) && defined(SO_NOSIGPIPE)
+    setsockopt(h->fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
 
     if (connect(h->fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         int e = errno;
