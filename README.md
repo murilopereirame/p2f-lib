@@ -152,7 +152,7 @@ Each release has the npm tarball attached, so no registry login is needed:
 
 ```json
 "dependencies": {
-  "p2f-lib": "https://github.com/murilopereirame/p2f-lib/releases/download/v0.3.0/murilopereirame-p2f-lib-0.3.0.tgz"
+  "p2f-lib": "https://github.com/murilopereirame/p2f-lib/releases/download/v0.4.0/murilopereirame-p2f-lib-0.4.0.tgz"
 }
 ```
 

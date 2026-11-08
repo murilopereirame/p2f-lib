@@ -1,6 +1,6 @@
 {
   "name": "@murilopereirame/p2f-lib",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "The peer-to-file client library for JavaScript: the p2f-lib C core compiled to WebAssembly, with a fetch-based client. Runs in Node, browsers and Electron.",
   "type": "module",
   "main": "dist/index.js",
