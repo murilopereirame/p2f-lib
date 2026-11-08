@@ -16,8 +16,13 @@ export {
   planResume,
   retryDelayMs,
   Sha256,
+  ctrXorAt,
+  TorrentLayout,
 } from "./core.js";
 export type { ResumePlan, TransferKey } from "./core.js";
+
+export { decodeTorrent, findDamagedPieces, repairFile, webseedFetcher } from "./repair.js";
+export type { FetchRange, RepairOptions, RepairPhase, RepairProgress, RepairResult, RepairTarget } from "./repair.js";
 
 export { P2FClient, waitForTorrentMeta } from "./client.js";
 export type { FetchLike, P2FClientOptions, RawRangeOptions, TorrentMetaOptions } from "./client.js";

@@ -18,6 +18,7 @@ head -c 20971520  /dev/urandom > "$T/root/Show Name/Season 01/ep02.mkv"
 : > "$T/root/Show Name/zero.txt"
 echo "hello" > "$T/root/Show Name/notes & stuff.txt"
 
+flip() { python3 -I -c 'import sys;f=open(sys.argv[1],"r+b");o=int(sys.argv[2]);f.seek(o);b=f.read(1);f.seek(o);f.write(bytes([b[0]^255]))' "$1" "$2"; }
 start_server() { env "$@" node tools/mock_server.mjs "$T/root" $PORT $TOKEN >/dev/null 2>&1 & SRV=$!; sleep 0.6; }
 stop_server()  { kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; }
 
@@ -71,13 +72,13 @@ mkdir -p "$T/out9"; head -c 100 /dev/urandom > "$T/out9/small.bin"
 $CLI $URL $TOKEN small.bin "$T/out9" >/dev/null 2>&1 && cmp "$T/root/small.bin" "$T/out9/small.bin" \
   && ok "oversized local -> rewrite" || bad "oversized local"
 
-# 10. Corrupt partial -> checksum fail, file removed, next try OK.
+# 10. Corrupt partial, --no-repair -> checksum fail, file removed, next try OK.
 mkdir -p "$T/out10"; head -c 4000000 /dev/urandom > "$T/out10/ep02.mkv"
-out=$($CLI $URL $TOKEN "Show Name/Season 01/ep02.mkv" "$T/out10" 2>/dev/null)
+out=$($CLI $URL $TOKEN "Show Name/Season 01/ep02.mkv" "$T/out10" --no-repair 2>/dev/null)
 echo "$out" | grep -q "checksum" && [ ! -e "$T/out10/ep02.mkv" ] \
   && $CLI $URL $TOKEN "Show Name/Season 01/ep02.mkv" "$T/out10" >/dev/null 2>&1 \
   && cmp "$T/root/Show Name/Season 01/ep02.mkv" "$T/out10/ep02.mkv" \
-  && ok "corrupt partial -> checksum -> clean retry" || bad "corrupt partial ($out)"
+  && ok "corrupt partial, no repair -> checksum -> clean retry" || bad "corrupt partial ($out)"
 
 # 10b. Resume from an odd offset (mid AES block: 5000001 = 312500*16 + 1).
 mkdir -p "$T/out10b"; cp "$T/part.mkv" "$T/out10b/ep02.mkv"
@@ -97,10 +98,92 @@ $CLI $URL $TOKEN "Show Name/Season 01/ep02.mkv" "$T/out12" >/dev/null 2>&1
 e=$(date +%s.%N); echo "INFO  20 MB in $(echo "$e - $s" | bc) s"
 stop_server
 
+# ---- Repair: fetch only the missing or damaged pieces again ---------------
+# The mock torrent has 256 KiB pieces: ep02.mkv (20 MiB) has 80, the
+# 1048581-byte file has 5 (the last one is 5 bytes).
+F2="Show Name/Season 01/ep02.mkv"; SRC2="$T/root/$F2"
+F1="Show Name/Season 01/ep 01 ção.mkv"; SRC1="$T/root/$F1"
+LOG="$T/ranges.log"
+bounded() { grep -c -- '-[0-9]' "$LOG" 2>/dev/null || true; }
+whole()   { grep -c -v -- '-[0-9]' "$LOG" 2>/dev/null || true; }
+start_server RANGE_LOG="$LOG"
+
+# R1. A corrupt partial: the finished download fails the checksum and is
+#     healed (pieces 0-15 fetched again), not removed.
+: > "$LOG"; mkdir -p "$T/r1"; head -c 4000000 /dev/urandom > "$T/r1/ep02.mkv"
+out=$($CLI $URL $TOKEN "$F2" "$T/r1" 2>/dev/null)
+cmp "$SRC2" "$T/r1/ep02.mkv" && echo "$out" | grep -q "repaired 16 pieces" && [ "$(bounded)" = 16 ] \
+  && ok "corrupt partial healed: 16 pieces fetched again" || bad "corrupt partial heal ($out, $(bounded) ranges)"
+
+# R2. A full-size file on disk with one bad byte: checked, one piece fetched.
+: > "$LOG"; mkdir -p "$T/r2"; cp "$SRC2" "$T/r2/ep02.mkv"; flip "$T/r2/ep02.mkv" 7000000
+out=$($CLI $URL $TOKEN "$F2" "$T/r2" 2>/dev/null)
+cmp "$SRC2" "$T/r2/ep02.mkv" && echo "$out" | grep -q "repaired 1 pieces" && [ "$(bounded)" = 1 ] && [ "$(whole)" = 0 ] \
+  && grep -q "bytes=6815744-7077887" "$LOG" \
+  && ok "full-size file with a bad byte: 1 piece fetched" || bad "full-size heal ($out, $(cat "$LOG"))"
+
+# R3. The short last piece.
+: > "$LOG"; mkdir -p "$T/r3"; cp "$SRC1" "$T/r3/"; flip "$T/r3/ep 01 ção.mkv" 1048580
+out=$($CLI $URL $TOKEN "$F1" "$T/r3" 2>/dev/null)
+cmp "$SRC1" "$T/r3/ep 01 ção.mkv" && grep -q "bytes=1048576-1048580" "$LOG" && [ "$(bounded)" = 1 ] \
+  && ok "short last piece healed" || bad "last piece ($out, $(cat "$LOG"))"
+
+# R4. Right bytes plus junk at the end: trimmed, nothing fetched.
+: > "$LOG"; mkdir -p "$T/r4"; { cat "$SRC1"; head -c 777 /dev/urandom; } > "$T/r4/ep 01 ção.mkv"
+out=$($CLI $URL $TOKEN "$F1" "$T/r4" 2>/dev/null)
+cmp "$SRC1" "$T/r4/ep 01 ção.mkv" && [ ! -s "$LOG" ] \
+  && ok "trailing junk trimmed, nothing fetched" || bad "trailing junk ($out, $(cat "$LOG"))"
+
+# R5. Several pieces, scattered.
+: > "$LOG"; mkdir -p "$T/r5"; cp "$SRC2" "$T/r5/ep02.mkv"
+for o in 0 300000 10000000 20971519; do flip "$T/r5/ep02.mkv" $o; done
+out=$($CLI $URL $TOKEN "$F2" "$T/r5" 2>/dev/null)
+cmp "$SRC2" "$T/r5/ep02.mkv" && echo "$out" | grep -q "repaired 4 pieces" \
+  && ok "4 scattered bad pieces healed" || bad "scattered ($out)"
+
+# R6. A good full-size file: checked, nothing fetched, not rewritten.
+: > "$LOG"; before=$(stat -c %Y "$T/r5/ep02.mkv"); sleep 1
+out=$($CLI $URL $TOKEN "$F2" "$T/r5" 2>/dev/null)
+[ "$before" = "$(stat -c %Y "$T/r5/ep02.mkv")" ] && [ ! -s "$LOG" ] && echo "$out" | grep -q "checked 80 pieces" \
+  && ok "good file checked, not fetched" || bad "good file ($out)"
+
+# R7. --no-repair: a bad full-size file is removed (the next call downloads it).
+mkdir -p "$T/r7"; cp "$SRC2" "$T/r7/ep02.mkv"; flip "$T/r7/ep02.mkv" 123
+out=$($CLI $URL $TOKEN "$F2" "$T/r7" --no-repair 2>/dev/null)
+echo "$out" | grep -q "error -9" && [ ! -e "$T/r7/ep02.mkv" ] \
+  && ok "no repair: bad full-size file removed" || bad "no repair ($out)"
+stop_server
+
+# R8. Bad data on the wire: the piece fails its hash, is fetched again, and
+#     is never written while wrong.
+: > "$LOG"; start_server RANGE_LOG="$LOG" CORRUPT_RANGES=2
+mkdir -p "$T/r8"; cp "$SRC2" "$T/r8/ep02.mkv"; flip "$T/r8/ep02.mkv" 5555555
+out=$($CLI $URL $TOKEN "$F2" "$T/r8" 2>/dev/null)
+cmp "$SRC2" "$T/r8/ep02.mkv" && [ "$(bounded)" = 3 ] \
+  && ok "bad piece data on the wire retried" || bad "wire corruption ($out, $(bounded) ranges)"
+stop_server
+
+# R9. A server with no torrent: fall back to remove + checksum error.
+start_server NO_TORRENT=1
+mkdir -p "$T/r9"; cp "$SRC2" "$T/r9/ep02.mkv"; flip "$T/r9/ep02.mkv" 99
+out=$($CLI $URL $TOKEN "$F2" "$T/r9" 2>/dev/null)
+echo "$out" | grep -q "error -9" && [ ! -e "$T/r9/ep02.mkv" ] \
+  && $CLI $URL $TOKEN "$F2" "$T/r9" >/dev/null 2>&1 && cmp "$SRC2" "$T/r9/ep02.mkv" \
+  && ok "no torrent: removed, clean retry" || bad "no torrent ($out)"
+stop_server
+
+# R10. Over TLS is covered by the same code path; a stop while checking
+#      keeps the file.
+start_server
+mkdir -p "$T/r10"; cp "$SRC2" "$T/r10/ep02.mkv"; flip "$T/r10/ep02.mkv" 1
+out=$($CLI $URL $TOKEN "$F2" "$T/r10" --abort-at 0 2>/dev/null)
+[ -e "$T/r10/ep02.mkv" ] && $CLI $URL $TOKEN "$F2" "$T/r10" >/dev/null 2>&1 && cmp "$SRC2" "$T/r10/ep02.mkv" \
+  && ok "stop, then heal on the next call" || bad "stop during repair ($out)"
+stop_server
+
 # ---- Large files: the server "prepares" a file before it has metadata ------
 # The real server reads and hashes a whole file before /api/torrent answers.
 # For a big file that is minutes; the client must wait it out, not fail.
-F2="Show Name/Season 01/ep02.mkv"
 
 # P1. New server: 202 "preparing" with progress, then the metadata.
 start_server PREPARE_MS=3000

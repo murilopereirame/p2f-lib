@@ -235,6 +235,13 @@ static int read_line(p2f_http *h, char *line, size_t max)
 int p2f_http_get(p2f_client *c, const char *path_query, int64_t range_start,
                  int timeout_ms, p2f_http *h)
 {
+    return p2f_http_get_range(c, path_query, range_start, -1, timeout_ms, h);
+}
+
+int p2f_http_get_range(p2f_client *c, const char *path_query,
+                       int64_t range_start, int64_t range_end,
+                       int timeout_ms, p2f_http *h)
+{
     struct sockaddr_in addr;
     char req[4096], line[2048];
     int one = 1, n;
@@ -281,7 +288,12 @@ int p2f_http_get(p2f_client *c, const char *path_query, int64_t range_start,
                  "Accept-Encoding: identity\r\n"
                  "Connection: close\r\n",
                  c->base_path, path_query, c->host, c->port, c->token);
-    if (n > 0 && range_start > 0 && (size_t)n < sizeof(req))
+    if (n > 0 && range_end >= range_start && range_start >= 0 &&
+        (size_t)n < sizeof(req))
+        n += snprintf(req + n, sizeof(req) - (size_t)n,
+                      "Range: bytes=%lld-%lld\r\n", (long long)range_start,
+                      (long long)range_end);
+    else if (n > 0 && range_start > 0 && (size_t)n < sizeof(req))
         n += snprintf(req + n, sizeof(req) - (size_t)n,
                       "Range: bytes=%lld-\r\n", (long long)range_start);
     if (n > 0 && (size_t)n < sizeof(req))

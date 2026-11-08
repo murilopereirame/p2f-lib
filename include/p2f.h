@@ -9,7 +9,9 @@
  *   - Resumable downloads (HTTP Range on the /api/raw webseed).
  *   - AES-256-CTR decrypt as the bytes arrive. The key is ECDH-wrapped
  *     (P-256 / HKDF-SHA256 / AES-256-GCM) per transfer.
- *   - SHA-256 check of each finished file.
+ *   - SHA-256 check of each finished file. A file that fails it is
+ *     repaired: each piece is checked against the torrent's piece hashes
+ *     and only the missing or damaged pieces are fetched again.
  *
  * Transport: http:// or https:// (TLS 1.2, mbedTLS). For HTTPS the server
  * certificate is checked against a built-in Mozilla CA bundle, or against
@@ -36,7 +38,8 @@ enum {
     P2F_ERR_IO = -6,        /* local file system error */
     P2F_ERR_ABORT = -7,     /* the progress callback asked to stop */
     P2F_ERR_SHORT = -8,     /* the file is incomplete (retry resumes it) */
-    P2F_ERR_CHECKSUM = -9,  /* SHA-256 mismatch; the file was removed */
+    P2F_ERR_CHECKSUM = -9,  /* SHA-256 mismatch that the repair could not
+                               fix; the file was removed */
     P2F_ERR_NOMEM = -10,
     P2F_ERR_NOTFOUND = -11, /* the remote path does not exist */
     P2F_ERR_TLS = -12       /* TLS setup failed or the certificate is not
@@ -142,7 +145,20 @@ typedef struct {
     int preparing;
     uint64_t prepare_done;
     uint64_t prepare_total;
+    /* Repair of the current file (it failed the checksum, or a full-size
+     * copy on disk is being checked). P2F_REPAIR_NONE when not repairing.
+     * repair_done / repair_total: pieces checked (P2F_REPAIR_VERIFYING) or
+     * fetched again (P2F_REPAIR_FETCHING). */
+    int repair_phase;
+    uint32_t repair_done;
+    uint32_t repair_total;
 } p2f_progress;
+
+enum {
+    P2F_REPAIR_NONE = 0,
+    P2F_REPAIR_VERIFYING = 1,  /* checking each piece of the local file */
+    P2F_REPAIR_FETCHING = 2    /* fetching the damaged pieces again */
+};
 
 /* Return non-zero to stop. The bytes on disk are kept for a resume. */
 typedef int (*p2f_progress_fn)(const p2f_progress *p, void *user);
@@ -150,12 +166,18 @@ typedef int (*p2f_progress_fn)(const p2f_progress *p, void *user);
 typedef struct {
     p2f_progress_fn on_progress;  /* may be NULL */
     void *user;
-    int verify;           /* 1 = check SHA-256 (the default if opts is NULL) */
+    /* 1 = check SHA-256 (the default if opts is NULL). It also checks a
+     * full-size file already on disk before it is skipped. */
+    int verify;
     int idle_timeout_ms;  /* drop a stalled stream; 0 means 60000 */
     /* Stop waiting for the server to prepare a file after this many ms
      * (P2F_ERR_NET, so a retry continues). 0 means wait until the progress
      * callback stops the download. */
     int prepare_timeout_ms;
+    /* 1 = do not repair: a file that fails the checksum is removed and
+     * P2F_ERR_CHECKSUM returned (the next call downloads it again). 0 (the
+     * default) fetches only its missing or damaged pieces again. */
+    int no_repair;
 } p2f_download_opts;
 
 /*

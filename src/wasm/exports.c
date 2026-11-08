@@ -137,3 +137,60 @@ EXPORT(p2f_sha256_final) void wasm_sha256_final(mbedtls_sha256_context *h,
     mbedtls_sha256_free(h);
     free(h);
 }
+
+/* ---- Repair ----------------------------------------------------------- */
+
+typedef struct {
+    p2f_torrent_layout t;
+    uint8_t *buf;  /* the .torrent; t.pieces points into it */
+} wasm_torrent;
+
+/* Parse a .torrent (copied). NULL if it is not a usable single-file one. */
+EXPORT(p2f_torrent_new) wasm_torrent *wasm_torrent_new(const uint8_t *buf, size_t len)
+{
+    wasm_torrent *w = malloc(sizeof(*w));
+    if (!w)
+        return NULL;
+    w->buf = malloc(len ? len : 1);
+    if (!w->buf) {
+        free(w);
+        return NULL;
+    }
+    memcpy(w->buf, buf, len);
+    if (p2f_torrent_parse(w->buf, len, &w->t) != P2F_OK) {
+        free(w->buf);
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+/* out[0] = piece length, out[1] = length, out[2] = piece count */
+EXPORT(p2f_torrent_info) void wasm_torrent_info(const wasm_torrent *w, double *out)
+{
+    out[0] = (double)w->t.piece_length;
+    out[1] = (double)w->t.length;
+    out[2] = (double)w->t.piece_count;
+}
+
+EXPORT(p2f_torrent_free) void wasm_torrent_free(wasm_torrent *w)
+{
+    if (!w)
+        return;
+    free(w->buf);
+    free(w);
+}
+
+/* 1 if this ciphertext is piece index, else 0. */
+EXPORT(p2f_piece_matches) int wasm_piece_matches(const wasm_torrent *w, double index,
+                                                 const uint8_t *cipher, size_t len)
+{
+    return p2f_piece_matches(&w->t, (size_t)index, cipher, len);
+}
+
+/* AES-256-CTR, in place, for bytes that sit at offset of the file. */
+EXPORT(p2f_ctr_xor_at) int wasm_ctr_xor_at(const uint8_t *key, const uint8_t *iv,
+                                           double offset, uint8_t *buf, size_t len)
+{
+    return p2f_ctr_xor_at(key, iv, (uint64_t)offset, buf, len);
+}

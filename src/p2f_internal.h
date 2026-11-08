@@ -72,6 +72,11 @@ typedef struct {
  */
 int p2f_http_get(p2f_client *c, const char *path_query, int64_t range_start,
                  int timeout_ms, p2f_http *h);
+/* The same, for the bytes range_start..range_end (inclusive). A range_end
+ * below range_start means "to the end", as p2f_http_get. */
+int p2f_http_get_range(p2f_client *c, const char *path_query,
+                       int64_t range_start, int64_t range_end,
+                       int timeout_ms, p2f_http *h);
 /* Read body bytes. Return >0 bytes, 0 at the end, <0 on error. */
 ssize_t p2f_http_read(p2f_http *h, void *out, size_t n);
 /* Read the whole body (NUL-terminated). Limit: max bytes. */

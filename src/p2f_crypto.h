@@ -52,4 +52,33 @@ int p2f_ctr_init(p2f_ctr *ctr, const uint8_t key[32], const uint8_t iv[16],
 int p2f_ctr_update(p2f_ctr *ctr, uint8_t *buf, size_t len);
 void p2f_ctr_free(p2f_ctr *ctr);
 
+/* ---- Repair (p2f_repair.c) -------------------------------------------- */
+
+/* The piece layout of a single-file torrent. pieces points into the
+ * buffer given to p2f_torrent_parse (20-byte SHA-1 of each piece of the
+ * ciphertext), so that buffer must outlive the layout. */
+typedef struct {
+    int64_t piece_length;
+    int64_t length;
+    size_t piece_count;
+    const uint8_t *pieces;
+} p2f_torrent_layout;
+
+/* Read the layout out of a .torrent file. P2F_ERR_PROTO if it is not a
+ * single-file torrent whose piece count fits its length. */
+int p2f_torrent_parse(const uint8_t *buf, size_t len, p2f_torrent_layout *out);
+
+/* The byte offset and size of one piece. */
+void p2f_torrent_piece(const p2f_torrent_layout *t, size_t index,
+                       int64_t *start, size_t *size);
+
+/* AES-256-CTR over buf, which sits at byte offset of the file (any offset,
+ * not only a block boundary). Encrypt and decrypt are the same. In place. */
+int p2f_ctr_xor_at(const uint8_t key[32], const uint8_t iv[16],
+                   uint64_t offset, uint8_t *buf, size_t len);
+
+/* 1 if this ciphertext is piece index (right size and SHA-1), else 0. */
+int p2f_piece_matches(const p2f_torrent_layout *t, size_t index,
+                      const uint8_t *cipher, size_t len);
+
 #endif

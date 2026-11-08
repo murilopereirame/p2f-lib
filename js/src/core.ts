@@ -29,6 +29,11 @@ interface Exports {
   p2f_sha256_new(): number;
   p2f_sha256_update(h: number, buf: number, len: number): void;
   p2f_sha256_final(h: number, out: number): void;
+  p2f_torrent_new(buf: number, len: number): number;
+  p2f_torrent_info(t: number, out: number): void;
+  p2f_torrent_free(t: number): void;
+  p2f_piece_matches(t: number, index: number, buf: number, len: number): number;
+  p2f_ctr_xor_at(key: number, iv: number, offset: number, buf: number, len: number): number;
 }
 
 let core: Exports | null = null;
@@ -330,5 +335,106 @@ export class Sha256 {
     this.ptr = 0;
     this.buf = 0;
     return Array.from(d, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+}
+
+// ---- repair ---------------------------------------------------------------
+
+/**
+ * AES-256-CTR over `data`, which sits at byte `offset` of the file (any
+ * offset). Encrypt and decrypt are the same. Returns a new array.
+ */
+export function ctrXorAt(data: Uint8Array, offset: number, key: Uint8Array, iv: Uint8Array): Uint8Array {
+  if (key.length !== 32 || iv.length !== 16) throw new Error("p2f-lib: key must be 32 bytes, iv 16 bytes");
+  const k = c();
+  const kp = put(key);
+  const ivp = put(iv);
+  const buf = put(data);
+  try {
+    if (k.p2f_ctr_xor_at(kp, ivp, offset, buf, data.length) !== 0) throw new P2FError(0, "p2f-lib: AES failed");
+    return bytes().slice(buf, buf + data.length);
+  } finally {
+    bytes().fill(0, kp, kp + 32);
+    bytes().fill(0, buf, buf + data.length);
+    k.p2f_free(kp);
+    k.p2f_free(ivp);
+    k.p2f_free(buf);
+  }
+}
+
+/**
+ * The piece layout of a file's torrent (`torrentBase64` of its metadata,
+ * decoded). The torrent lists the SHA-1 of each piece of the ciphertext;
+ * `matches` checks one piece against it. Call `dispose` when done.
+ */
+export class TorrentLayout {
+  readonly pieceLength: number;
+  readonly length: number;
+  readonly pieceCount: number;
+  private ptr: number;
+  // Scratch memory in the core; a separate object so the finalizer does not
+  // hold on to `this`.
+  private readonly scratch = { buf: 0, len: 0 };
+
+  constructor(torrent: Uint8Array) {
+    const k = c();
+    const tp = put(torrent);
+    try {
+      this.ptr = k.p2f_torrent_new(tp, torrent.length);
+    } finally {
+      k.p2f_free(tp);
+    }
+    if (!this.ptr) throw new P2FError(0, "p2f-lib: not a usable single-file torrent");
+    const out = k.p2f_alloc(24);
+    try {
+      k.p2f_torrent_info(this.ptr, out);
+      const v = new Float64Array(k.memory.buffer, out, 3);
+      this.pieceLength = v[0] ?? 0;
+      this.length = v[1] ?? 0;
+      this.pieceCount = v[2] ?? 0;
+    } finally {
+      k.p2f_free(out);
+    }
+    const ptr = this.ptr;
+    const scratch = this.scratch;
+    finalizer.register(this, () => {
+      k.p2f_torrent_free(ptr);
+      if (scratch.buf) k.p2f_free(scratch.buf);
+    }, this);
+  }
+
+  /** The byte offset and size of piece `index`. */
+  piece(index: number): { start: number; size: number } {
+    const start = index * this.pieceLength;
+    return { start, size: Math.max(0, Math.min(this.pieceLength, this.length - start)) };
+  }
+
+  /** True if `cipher` is piece `index` of the ciphertext (size and SHA-1). */
+  matches(index: number, cipher: Uint8Array): boolean {
+    if (!this.ptr) throw new Error("p2f-lib: this torrent was disposed");
+    const k = c();
+    const m = this.scratch;
+    if (cipher.length > m.len) {
+      if (m.buf) k.p2f_free(m.buf);
+      m.len = Math.max(cipher.length, 64 * 1024);
+      m.buf = k.p2f_alloc(m.len);
+      if (!m.buf) {
+        m.len = 0;
+        throw new P2FError(0, "p2f-lib: out of memory");
+      }
+    }
+    bytes().set(cipher, m.buf);
+    return k.p2f_piece_matches(this.ptr, index, m.buf, cipher.length) === 1;
+  }
+
+  dispose(): void {
+    if (!this.ptr) return;
+    finalizer.unregister(this);
+    const k = c();
+    k.p2f_torrent_free(this.ptr);
+    if (this.scratch.buf) k.p2f_free(this.scratch.buf);
+    this.ptr = 0;
+    this.scratch.buf = 0;
+    this.scratch.len = 0;
   }
 }
