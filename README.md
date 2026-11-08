@@ -37,8 +37,9 @@ What the library does:
 | Path | Contents |
 |---|---|
 | `include/p2f.h` | The public C API. |
+| `include/p2f_platform.h` | The platform hooks (random, resolver, sleep, clock) that each app provides. |
 | `src/` | The library. `p2f_policy.c` (resume plan, retry policy) and `p2f_crypto.c` have no I/O and are in every build. |
-| `src/platform/` | `posix.c` (desktop), `ps4.c` (OpenOrbis), `wasm.c` (random only). |
+| `src/platform/` | `posix.c` (desktop builds and tests) and `wasm.c` (random only, for the JS package). No console code: the PS4 hooks are in P2PS. |
 | `src/wasm/exports.c` | The WebAssembly exports. |
 | `js/` | The JavaScript package (`@murilopereirame/p2f-lib`). |
 | `tools/` | `p2f-cli`, the mock server and the end-to-end tests. |
@@ -60,6 +61,8 @@ cd js && npm ci && npm test           # JS package (needs build/wasm/p2f.wasm)
 ```
 
 `libp2f.a` already contains mbedTLS and cJSON: link only `libp2f.a`.
+The PS4 `libp2f.a` has no platform layer; the app links its own
+implementation of `include/p2f_platform.h` (P2PS: `ps4/platform_ps4.c`).
 
 ## C usage
 

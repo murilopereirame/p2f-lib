@@ -11,28 +11,15 @@
 #include "p2f.h"
 
 #include "p2f_crypto.h"
+#include "p2f_platform.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 
-/* ---- Platform layer (src/platform/posix.c or src/platform/ps4.c) ------- */
+/* ---- Platform layer: see include/p2f_platform.h ----------------------- */
 
-/* Sleep. */
-void p2f_platform_sleep_ms(int ms);
-/* A monotonic clock in ms (any start point). */
-uint64_t p2f_platform_now_ms(void);
-
-/* Resolve a host name or an IPv4 literal. Return 0 on success.
- * On failure, err receives the reason (may be empty). */
-int p2f_platform_resolve(const char *host, struct in_addr *out,
-                         char *err, size_t errlen);
 /* p2f_dns.c: literal, cache, DNS override, then p2f_platform_resolve. */
 int p2f_resolve(const char *host, struct in_addr *out, char *err, size_t errlen);
-
-/* p2f_dns.c: one A-record query over UDP. Return 0 on success. */
-int p2f_dns_query_a(const char *server, uint16_t port, const char *host,
-                    int timeout_ms, struct in_addr *out,
-                    char *err, size_t errlen);
 
 /* ---- Client ----------------------------------------------------------- */
 

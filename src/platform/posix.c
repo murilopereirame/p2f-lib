@@ -1,4 +1,6 @@
-/* Platform layer for Linux, macOS and other POSIX systems. */
+/* The platform hooks (include/p2f_platform.h) for Linux, macOS and other
+ * POSIX systems: the desktop build and the tests. Console and device apps
+ * provide their own. */
 #include <stdio.h>
 #include <string.h>
 #include <netdb.h>

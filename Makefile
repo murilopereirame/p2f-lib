@@ -3,7 +3,9 @@
 #   make              desktop library + p2f-cli     -> build/host/
 #   make test         desktop build + end-to-end tests (needs Node 20+)
 #   make ps4          PS4 library (OpenOrbis)        -> build/ps4/libp2f.a
-#                     needs OO_PS4_TOOLCHAIN=/path/to/PS4Toolchain
+#                     needs OO_PS4_TOOLCHAIN=/path/to/PS4Toolchain. It has no
+#                     platform layer: the app defines the hooks in
+#                     include/p2f_platform.h (P2PS: ps4/platform_ps4.c).
 #   make wasm         WebAssembly core for the JavaScript package
 #                     -> build/wasm/p2f.wasm; needs WASI_SDK_PATH=/path/to/wasi-sdk
 #   make dist         release bundles                -> dist/
@@ -58,8 +60,8 @@ PS4_CC    ?= clang
 PS4_AR    ?= llvm-ar
 PS4_CFLAGS = --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -O2 \
              -isysroot $(OO_PS4_TOOLCHAIN) -isystem $(OO_PS4_TOOLCHAIN)/include \
-             $(INCS) $(DEFS) -DP2F_PS4
-PS4_OBJ   := $(patsubst %.c,$(PS4)/%.o,$(CORE_SRC) src/platform/ps4.c $(MBED_SRC))
+             $(INCS) $(DEFS)
+PS4_OBJ   := $(patsubst %.c,$(PS4)/%.o,$(CORE_SRC) $(MBED_SRC))
 
 ps4: $(PS4)/libp2f.a
 
@@ -129,7 +131,7 @@ dist: dist-host dist-ps4 dist-wasm
 define bundle
 	rm -rf build/dist/p2f-lib-$(1)
 	mkdir -p build/dist/p2f-lib-$(1)/include build/dist/p2f-lib-$(1)/lib dist
-	cp include/p2f.h build/dist/p2f-lib-$(1)/include/
+	cp include/p2f.h include/p2f_platform.h build/dist/p2f-lib-$(1)/include/
 	cp $(2) build/dist/p2f-lib-$(1)/lib/
 	$(if $(3),mkdir -p build/dist/p2f-lib-$(1)/bin && cp $(3) build/dist/p2f-lib-$(1)/bin/)
 	cp LICENSE THIRD_PARTY.md VERSION build/dist/p2f-lib-$(1)/

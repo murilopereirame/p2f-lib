@@ -14,8 +14,9 @@
 #include "mbedtls/ecp.h"
 #include "mbedtls/bignum.h"
 
-/* Fill buf with secure random bytes. Return 0 on success.
- * Each platform file (src/platform/) has one. */
+/* Fill buf with secure random bytes (an app/platform hook, see
+ * include/p2f_platform.h; declared here so the wasm build needs no
+ * network headers). */
 int p2f_platform_random(void *buf, size_t len);
 
 /* ---- Crypto (p2f_crypto.c) -------------------------------------------- */
