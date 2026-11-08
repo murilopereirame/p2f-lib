@@ -1,5 +1,9 @@
 /**
- * The resumable download of a file or a folder from a peer-to-file server.
+ * The resumable download of a file or a folder from a peer-to-file server,
+ * for Node (it writes to the local disk). Import it from "…/p2f-lib/node".
+ * The protocol work — key unwrap, decryption, checksum, resume plan, retry
+ * policy — runs in the shared C core (WebAssembly); the C library's
+ * p2f_download_path does the same thing natively.
  *
  * The shape mirrors a plain SFTP fetch on purpose, so a caller can swap one
  * for the other: give it a remote path and a local folder, get progress
@@ -18,21 +22,14 @@
  * The remote data is never changed. This client only reads.
  */
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, rm, stat } from "node:fs/promises";
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { P2FClient } from "./client.js";
-import {
-  BLOCK_LEN,
-  createCtrDecipherAt,
-  DropBytes,
-  generateClientKeyPair,
-  unwrapTransferKey,
-} from "./crypto.js";
+import { BLOCK_LEN, ClientKeyPair, CtrStream, generateClientKeyPair, initP2F, planResume, Sha256 } from "./core.js";
 import { P2FError } from "./types.js";
-import type { ClientKeyPair } from "./crypto.js";
+import type { PrepareProgress } from "./types.js";
 
 export interface Transfer {
   bytesDone: number;
@@ -54,28 +51,12 @@ export interface DownloadOptions {
   /** Destroy a stalled connection after this many ms with no bytes, so the
    * caller's retry can resume it. Default 60000. Zero turns it off. */
   idleTimeoutMs?: number;
-}
-
-/** What to do with one file, from the bytes it has on the local disk. */
-export interface ResumePlan {
-  /** The file is complete. Do not copy it. */
-  skip: boolean;
-  /** The plaintext byte offset to resume from. */
-  start: number;
-  /** Add to the local file (a resume), or write it new (from the start). */
-  append: boolean;
-}
-
-/**
- * Decide how to copy one file, from the local size and the plaintext size.
- *   equal          the file is done. Skip it.
- *   local smaller  a part is there. Resume from the local size.
- *   local bigger   the local file is bad. Write it again from the start.
- */
-export function planResume(existing: number, size: number): ResumePlan {
-  if (existing === size) return { skip: true, start: size, append: false };
-  if (existing > size) return { skip: false, start: 0, append: false };
-  return { skip: false, start: existing, append: existing > 0 };
+  /** Called while the server prepares a file (a big file takes a while the
+   * first time it is asked for). */
+  onPreparing?: (progress: PrepareProgress & { remote: string }) => void;
+  /** Stop waiting for the server to prepare a file after this many ms (a
+   * retryable error). Default: wait until `signal` aborts. */
+  prepareTimeoutMs?: number;
 }
 
 /** The size of a local file, or 0 if it is not there. */
@@ -174,9 +155,59 @@ async function subtree(client: P2FClient, remoteDir: string, base: string): Prom
 
 /** The SHA-256 (hex) of a whole local file. */
 async function fileSha256(target: string): Promise<string> {
-  const hash = crypto.createHash("sha256");
-  await pipeline(createReadStream(target), hash);
-  return hash.digest("hex");
+  const hash = new Sha256();
+  for await (const chunk of createReadStream(target, { highWaterMark: 1024 * 1024 })) {
+    hash.update(chunk as Buffer);
+  }
+  return hash.digestHex();
+}
+
+/** A Transform that runs the core's AES-256-CTR over the stream. */
+class CtrTransform extends Transform {
+  constructor(private readonly ctr: CtrStream) {
+    super();
+  }
+
+  override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
+    try {
+      const out = this.ctr.update(chunk);
+      cb(null, Buffer.from(out.buffer, out.byteOffset, out.byteLength));
+    } catch (err) {
+      cb(err as Error);
+    }
+  }
+
+  override _flush(cb: (err?: Error | null) => void): void {
+    this.ctr.dispose();
+    cb();
+  }
+
+  override _destroy(err: Error | null, cb: (err?: Error | null) => void): void {
+    this.ctr.dispose();
+    cb(err);
+  }
+}
+
+/** Drop the first `count` bytes of a stream (the resume offset inside the
+ * first AES block). */
+export class DropBytes extends Transform {
+  private left: number;
+
+  constructor(count: number) {
+    super();
+    this.left = count;
+  }
+
+  override _transform(chunk: Buffer, _enc: BufferEncoding, cb: (err?: Error | null, data?: Buffer) => void): void {
+    if (this.left <= 0) return cb(null, chunk);
+    if (chunk.length <= this.left) {
+      this.left -= chunk.length;
+      return cb();
+    }
+    const rest = chunk.subarray(this.left);
+    this.left = 0;
+    cb(null, rest);
+  }
 }
 
 /**
@@ -201,13 +232,21 @@ async function downloadFile(
 
   // The metadata carries the authoritative plaintext length, the wrapped
   // key, and the checksum. It is cheap (cached server-side after the first).
-  const meta = await client.torrentMeta(file.remote, keyPair.clientPublicKeyBase64);
+  // The server reads and hashes the whole file before it answers this; for
+  // a big file that takes minutes the first time. torrentMeta waits it out.
+  const meta = await client.torrentMeta(file.remote, keyPair.publicKeyBase64, {
+    signal: opts.signal,
+    prepareTimeoutMs: opts.prepareTimeoutMs,
+    onPreparing: (p) => opts.onPreparing?.({ ...p, remote: file.remote }),
+  });
   const length = meta.length;
-  const { key, iv } = unwrapTransferKey(keyPair.ecdh, serverPublicKeyBase64, meta.encKeyWrapped);
+  const { key, iv } = keyPair.unwrap(serverPublicKeyBase64, meta.encKeyWrapped);
 
   const plan = planResume(existing, length);
 
   if (plan.skip) {
+    // An empty remote file: make sure the local file exists (as the C client does).
+    if (length === 0) await writeFile(local, new Uint8Array(0), { flag: "a" });
     transfer.bytesDone = base + length;
     transfer.filesDone += 1;
     onProgress?.(transfer);
@@ -262,7 +301,8 @@ async function downloadFile(
     if (!res.body) throw new P2FError(0, "webseed response had no body");
 
     const source = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]);
-    const decipher = createCtrDecipherAt(key, iv, blockStart / BLOCK_LEN);
+    const decipher = new CtrTransform(new CtrStream(key, iv, blockStart / BLOCK_LEN));
+    key.fill(0);
     const drop = new DropBytes(dropCount);
     const counter = new Counter((written) => {
       bumpIdle();
@@ -317,9 +357,26 @@ export async function downloadPath(
   localDir: string,
   opts: DownloadOptions = {},
 ): Promise<string> {
-  const info = await client.info();
+  await initP2F();
+  const info = await client.info(opts.signal);
   const serverPublicKeyBase64 = info.ecdhPublicKey;
   const keyPair = generateClientKeyPair();
+  try {
+    return await downloadAll(client, remotePath, localDir, opts, keyPair, serverPublicKeyBase64);
+  } finally {
+    keyPair.dispose();
+  }
+}
+
+async function downloadAll(
+  client: P2FClient,
+  remotePath: string,
+  localDir: string,
+  opts: DownloadOptions,
+  keyPair: ClientKeyPair,
+  serverPublicKeyBase64: string,
+): Promise<string> {
+  remotePath = remotePath.replace(/^\/+|\/+$/g, "");
 
   const { files, isDir } = await enumerate(client, remotePath);
 
@@ -344,3 +401,5 @@ export async function downloadPath(
 
   return target;
 }
+
+export * from "./index.js";
