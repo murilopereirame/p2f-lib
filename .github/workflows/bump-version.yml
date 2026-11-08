@@ -1,0 +1,60 @@
+# Bump the library version on main, by hand (Actions tab -> "Bump version"
+# -> Run workflow). It changes VERSION, js/package.json and
+# js/package-lock.json, commits them to main and tags that commit
+# v<version> (for example v0.4.1). It does not build or release anything:
+# publish a release from the tag, and release.yml (a separate workflow)
+# builds and attaches the libraries and publishes the npm package.
+name: Bump version
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "patch (0.4.0 -> 0.4.1), minor (-> 0.5.0) or major (-> 1.0.0)"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: "Or set this exact version (X.Y.Z); overrides bump"
+        required: false
+        default: ""
+
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Bump
+        id: bump
+        run: |
+          old=$(cat VERSION)
+          new=$(scripts/bump_version.sh "${INPUT_VERSION:-$INPUT_BUMP}")
+          if git ls-remote --exit-code --tags origin "refs/tags/v$new" >/dev/null; then
+            echo "::error::tag v$new already exists"
+            exit 1
+          fi
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "### Version $old -> $new" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          INPUT_BUMP: ${{ inputs.bump }}
+          INPUT_VERSION: ${{ inputs.version }}
+      - name: Commit to main and tag
+        run: |
+          v=${{ steps.bump.outputs.new }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Bump version to $v"
+          git tag -a "v$v" -m "p2f-lib $v"
+          git push --atomic origin HEAD:main "refs/tags/v$v"
+          echo "Tagged \`v$v\`" >> "$GITHUB_STEP_SUMMARY"

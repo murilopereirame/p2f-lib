@@ -165,7 +165,19 @@ Every merge to `main` builds and tests everything. If `VERSION` (and
 `js/package.json`, which must match) holds a version that has no release yet,
 the workflow publishes it: a GitHub Release `v<version>` with the PS4,
 desktop, Android and iOS bundles, the WebAssembly core and the npm tarball, plus the npm
-package on GitHub Packages. To release, bump both version numbers in the PR.
+package on GitHub Packages.
+
+To release:
+
+1. Run **Bump version** (Actions tab, `.github/workflows/bump-version.yml`).
+   Pick `patch`, `minor` or `major`, or type an exact version. It updates
+   `VERSION`, `js/package.json` and `js/package-lock.json`, commits them to
+   `main` and tags the commit `v<version>`. It builds nothing. Locally:
+   `scripts/bump_version.sh patch`.
+2. Publish a GitHub release from that tag. The Release workflow builds
+   everything from the tag and attaches the bundles and the npm tarball to it.
+
+Bumping the version in a PR still works too: the merge publishes it.
 
 ## Changes from 0.1 (the TypeScript library)
 

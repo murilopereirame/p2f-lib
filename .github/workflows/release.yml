@@ -1,14 +1,20 @@
-# On every merge to main: build and test everything (ci.yml), then publish
-# the version in VERSION if it is not published yet:
-#   - a GitHub Release v<version> with the desktop, PS4, Android and iOS
-#     libraries, the WebAssembly core and the npm tarball;
-#   - the npm package @murilopereirame/p2f-lib on GitHub Packages.
-# A merge that does not change VERSION builds and tests, and publishes nothing.
+# Build and test everything (ci.yml), then publish:
+#   - on a merge to main (or a manual run): if VERSION has no release yet, a
+#     GitHub Release v<version> with the desktop, PS4, Android and iOS
+#     libraries, the WebAssembly core and the npm tarball. A merge that does
+#     not change VERSION builds and tests, and publishes nothing.
+#   - on a GitHub release published by hand (for example from the tag that
+#     the "Bump version" workflow made): the same files, attached to that
+#     release. Its tag must be v<VERSION>.
+#   - either way, the npm package @murilopereirame/p2f-lib on GitHub
+#     Packages, if that version is not there yet.
 name: Release
 
 on:
   push:
     branches: [main]
+  release:
+    types: [published]
   workflow_dispatch:
 
 concurrency:
@@ -40,7 +46,14 @@ jobs:
             exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          if gh release view "v$v" >/dev/null 2>&1; then
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            tag="${{ github.event.release.tag_name }}"
+            if [ "$tag" != "v$v" ]; then
+              echo "::error::release tag $tag does not match VERSION $v (expected v$v)"
+              exit 1
+            fi
+            echo "exists=attach" >> "$GITHUB_OUTPUT"
+          elif gh release view "v$v" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "::notice::v$v is already released. Bump VERSION and js/package.json to publish."
           else
@@ -68,14 +81,28 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Attach to the release
+        if: steps.version.outputs.exists == 'attach'
+        run: |
+          gh release upload "v${{ steps.version.outputs.version }}" --clobber \
+            $(find out -type f \( -name "p2f-*" -o -name "*.tgz" \))
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - uses: actions/setup-node@v4
-        if: steps.version.outputs.exists == 'false'
+        if: steps.version.outputs.exists != 'true'
         with:
           node-version: '22'
           registry-url: https://npm.pkg.github.com
           scope: '@murilopereirame'
       - name: GitHub Packages (npm)
-        if: steps.version.outputs.exists == 'false'
-        run: npm publish "$(find out -type f -name "murilopereirame-p2f-lib-${{ steps.version.outputs.version }}.tgz")"
+        if: steps.version.outputs.exists != 'true'
+        run: |
+          v=${{ steps.version.outputs.version }}
+          if [ "$(npm view "@murilopereirame/p2f-lib@$v" version 2>/dev/null)" = "$v" ]; then
+            echo "::notice::@murilopereirame/p2f-lib@$v is already on GitHub Packages"
+          else
+            npm publish "$(find out -type f -name "murilopereirame-p2f-lib-$v.tgz")"
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ github.token }}
