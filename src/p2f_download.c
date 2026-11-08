@@ -6,7 +6,15 @@
  *     the ciphertext from that offset (HTTP Range) and appends the rest.
  *     CTR is seekable, so the resume is byte-exact.
  *   - A finished file is checked against the server's plaintext SHA-256.
+ *     A file that fails it is repaired: each piece is checked against the
+ *     torrent's piece hashes and only the bad ones are fetched again (see
+ *     heal_file). A full-size file on disk is checked the same way before
+ *     it is skipped.
  */
+/* 64-bit file offsets on 32-bit targets (Android armeabi-v7a). */
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +25,7 @@
 #include "cJSON.h"
 #include "p2f_internal.h"
 
+#include "mbedtls/base64.h"
 #include "mbedtls/sha256.h"
 
 #define BLOCK_LEN 16
@@ -263,6 +272,7 @@ typedef struct {
     int64_t length;
     char wrapped[256];
     char sha256[65];
+    char *torrent_b64;  /* the .torrent, Base64; NULL if the server sent none */
 } file_meta;
 
 /*
@@ -291,7 +301,7 @@ static int wait_or_stop(run_state *s, int ms)
 static int parse_meta(p2f_client *c, const char *remote, const char *body,
                       file_meta *m)
 {
-    const cJSON *len, *wrap, *sha;
+    const cJSON *len, *wrap, *sha, *tor;
     cJSON *j = cJSON_Parse(body);
 
     len = cJSON_GetObjectItemCaseSensitive(j, "length");
@@ -307,6 +317,11 @@ static int parse_meta(p2f_client *c, const char *remote, const char *body,
     m->sha256[0] = '\0';
     if (cJSON_IsString(sha) && strlen(sha->valuestring) == 64)
         strcpy(m->sha256, sha->valuestring);
+    tor = cJSON_GetObjectItemCaseSensitive(j, "torrentBase64");
+    free(m->torrent_b64);
+    m->torrent_b64 = NULL;
+    if (cJSON_IsString(tor) && tor->valuestring[0])
+        m->torrent_b64 = strdup(tor->valuestring);  /* NULL: no repair */
     cJSON_Delete(j);
     return P2F_OK;
 }
@@ -402,14 +417,267 @@ static int fetch_meta(p2f_client *c, const char *remote, const char *ck,
     return rc;
 }
 
+/* ---- Repair ----------------------------------------------------------- */
+
+#define REPAIR_TRIES 4                       /* per piece */
+#define REPAIR_MAX_PIECE (64 * 1024 * 1024)  /* the server uses up to 8 MiB */
+
+static void set_repair(run_state *s, int phase, uint32_t done, uint32_t total)
+{
+    s->prog.repair_phase = phase;
+    s->prog.repair_done = done;
+    s->prog.repair_total = total;
+}
+
+/*
+ * Fetch the ciphertext of one piece into buf with a range request, and
+ * check it against its hash. Network errors and bad data are tried again.
+ */
+static int fetch_piece(p2f_client *c, const char *pq, const p2f_torrent_layout *t,
+                       size_t index, uint8_t *buf, int idle, run_state *s)
+{
+    int64_t start;
+    size_t size;
+    int attempt, rc = P2F_ERR_NET;
+
+    p2f_torrent_piece(t, index, &start, &size);
+    for (attempt = 0; attempt < REPAIR_TRIES; attempt++) {
+        p2f_http h;
+        size_t got = 0;
+        int status;
+
+        if (attempt > 0 && wait_or_stop(s, 1000 << (attempt - 1)))
+            return P2F_ERR_ABORT;
+        c->last_status = 0;
+        rc = p2f_http_get_range(c, pq, start, start + (int64_t)size - 1, idle, &h);
+        if (rc == P2F_ERR_NET)
+            continue;
+        if (rc != P2F_OK)
+            return rc;
+        status = h.status;
+        /* 206, or a 200 with the whole file when the piece starts at 0. */
+        if (status != 206 && !(status == 200 && start == 0)) {
+            p2f_http_close(&h);
+            c->last_status = status;
+            rc = p2f_fail(c, P2F_ERR_HTTP,
+                          "webseed answered HTTP %d to a range request", status);
+            if (status == 408 || status == 429 || status >= 500)
+                continue;
+            return rc;
+        }
+        while (got < size) {
+            ssize_t n = p2f_http_read(&h, buf + got, size - got);
+            if (n <= 0)
+                break;
+            got += (size_t)n;
+            if (report(s)) {
+                p2f_http_close(&h);
+                return P2F_ERR_ABORT;
+            }
+        }
+        p2f_http_close(&h);
+        if (got == size && p2f_piece_matches(t, index, buf, size))
+            return P2F_OK;
+        rc = got == size
+                 ? p2f_fail(c, P2F_ERR_CHECKSUM, "piece %lu of %s failed its hash",
+                            (unsigned long)index, pq)
+                 : p2f_fail(c, P2F_ERR_NET, "piece %lu: connection lost",
+                            (unsigned long)index);
+    }
+    return rc;
+}
+
+/*
+ * Heal a local file in place: check every piece against the torrent and
+ * fetch only the missing or damaged ones. Data that fails its hash is never
+ * written. The file ends at exactly the right length. *fixed receives the
+ * number of pieces fetched again.
+ */
+static int heal_file(p2f_client *c, const remote_file *file, const char *local,
+                     const file_meta *m, const uint8_t key[32],
+                     const uint8_t iv[16], run_state *s, size_t *fixed)
+{
+    uint8_t *torrent = NULL, *buf = NULL;
+    size_t tlen = 0, i, nbad = 0, *bad = NULL;
+    p2f_torrent_layout t;
+    FILE *f = NULL;
+    char *pq = NULL;
+    int64_t have;
+    int rc, idle;
+
+    *fixed = 0;
+    if (!m->torrent_b64)
+        return p2f_fail(c, P2F_ERR_PROTO, "no torrent to repair %s", file->remote);
+    {
+        size_t slen = strlen(m->torrent_b64);
+        mbedtls_base64_decode(NULL, 0, &tlen, (const unsigned char *)m->torrent_b64, slen);
+        torrent = malloc(tlen ? tlen : 1);
+        if (!torrent)
+            return P2F_ERR_NOMEM;
+        if (mbedtls_base64_decode(torrent, tlen, &tlen,
+                                  (const unsigned char *)m->torrent_b64, slen) != 0) {
+            rc = p2f_fail(c, P2F_ERR_PROTO, "bad torrent for %s", file->remote);
+            goto out;
+        }
+    }
+    if (p2f_torrent_parse(torrent, tlen, &t) != P2F_OK || t.length != m->length ||
+        t.piece_length > REPAIR_MAX_PIECE) {
+        rc = p2f_fail(c, P2F_ERR_PROTO, "the torrent of %s cannot be used to repair it",
+                      file->remote);
+        goto out;
+    }
+
+    buf = malloc((size_t)t.piece_length);
+    bad = malloc((t.piece_count ? t.piece_count : 1) * sizeof(*bad));
+    if (!buf || !bad) {
+        rc = P2F_ERR_NOMEM;
+        goto out;
+    }
+    f = fopen(local, "r+b");
+    if (!f)
+        f = fopen(local, "w+b");
+    if (!f) {
+        rc = p2f_fail(c, P2F_ERR_IO, "cannot open %s (errno %d)", local, errno);
+        goto out;
+    }
+    have = local_size(local);
+
+    /* 1. Which pieces are wrong? Encrypt each again and check its hash. */
+    set_repair(s, P2F_REPAIR_VERIFYING, 0, (uint32_t)t.piece_count);
+    if (report(s)) {
+        rc = P2F_ERR_ABORT;
+        goto out;
+    }
+    for (i = 0; i < t.piece_count; i++) {
+        int64_t start;
+        size_t size;
+        int ok = 0;
+        p2f_torrent_piece(&t, i, &start, &size);
+        if (start + (int64_t)size <= have && fseeko(f, (off_t)start, SEEK_SET) == 0 &&
+            fread(buf, 1, size, f) == size &&
+            p2f_ctr_xor_at(key, iv, (uint64_t)start, buf, size) == P2F_OK)
+            ok = p2f_piece_matches(&t, i, buf, size);
+        if (!ok)
+            bad[nbad++] = i;
+        if ((i & 15) == 15 || i + 1 == t.piece_count) {
+            s->prog.repair_done = (uint32_t)(i + 1);
+            if (report(s)) {
+                rc = P2F_ERR_ABORT;
+                goto out;
+            }
+        }
+    }
+
+    /* 2. Fetch those again, check, decrypt, write in place. */
+    if (nbad > 0) {
+        char *enc = p2f_urlencode(file->remote);
+        pq = enc ? malloc(strlen(enc) + 24) : NULL;
+        if (!pq) {
+            free(enc);
+            rc = P2F_ERR_NOMEM;
+            goto out;
+        }
+        sprintf(pq, "/api/raw?path=%s", enc);
+        free(enc);
+        idle = s->opts->idle_timeout_ms > 0 ? s->opts->idle_timeout_ms : 60000;
+        set_repair(s, P2F_REPAIR_FETCHING, 0, (uint32_t)nbad);
+        if (report(s)) {
+            rc = P2F_ERR_ABORT;
+            goto out;
+        }
+        for (i = 0; i < nbad; i++) {
+            int64_t start;
+            size_t size;
+            p2f_torrent_piece(&t, bad[i], &start, &size);
+            rc = fetch_piece(c, pq, &t, bad[i], buf, idle, s);
+            if (rc != P2F_OK)
+                goto out;
+            p2f_ctr_xor_at(key, iv, (uint64_t)start, buf, size);
+            if (fseeko(f, (off_t)start, SEEK_SET) != 0 || fwrite(buf, 1, size, f) != size) {
+                rc = p2f_fail(c, P2F_ERR_IO, "write failed (disk full?)");
+                goto out;
+            }
+            *fixed = i + 1;
+            s->prog.repair_done = (uint32_t)(i + 1);
+            if (report(s)) {
+                rc = P2F_ERR_ABORT;
+                goto out;
+            }
+        }
+    }
+
+    /* 3. Drop any bytes past the end (only then: it would touch the mtime). */
+    if (fflush(f) != 0 ||
+        (have != t.length && ftruncate(fileno(f), (off_t)t.length) != 0)) {
+        rc = p2f_fail(c, P2F_ERR_IO, "cannot write %s (errno %d)", local, errno);
+        goto out;
+    }
+    rc = P2F_OK;
+
+out:
+    if (f && fclose(f) != 0 && rc == P2F_OK)
+        rc = p2f_fail(c, P2F_ERR_IO, "close failed for %s", local);
+    set_repair(s, P2F_REPAIR_NONE, 0, 0);
+    if (buf) {
+        memset(buf, 0, (size_t)t.piece_length);
+        free(buf);
+    }
+    free(bad);
+    free(torrent);
+    free(pq);
+    return rc;
+}
+
+/*
+ * A local file at full size (or longer) is not known to be right: check it
+ * and repair it. failed_sha: it already failed the SHA-256 check. P2F_OK
+ * means it is right now. A stop or a network error keeps the bytes (the
+ * next call checks again); any other failure removes the file.
+ */
+static int check_and_heal(p2f_client *c, const remote_file *file,
+                          const char *local, const file_meta *m,
+                          const uint8_t key[32], const uint8_t iv[16],
+                          run_state *s, int failed_sha)
+{
+    int repair = !s->opts->no_repair && m->torrent_b64 != NULL;
+    char got[65];
+    int rc;
+
+    if (repair) {
+        size_t fixed = 0;
+        rc = heal_file(c, file, local, m, key, iv, s, &fixed);
+        if (rc == P2F_ERR_ABORT || rc == P2F_ERR_NET || rc == P2F_ERR_NOMEM)
+            return rc;
+        /* Every piece is right and the length too: the file is right. */
+        if (rc == P2F_OK && fixed == 0 && !failed_sha)
+            return P2F_OK;
+        if (rc == P2F_OK) {
+            rc = file_sha256(local, got);
+            if (rc != P2F_OK)
+                return p2f_fail(c, rc, "cannot read %s to verify", local);
+            if (strcmp(got, m->sha256) == 0)
+                return P2F_OK;
+        }
+    } else if (!failed_sha && local_size(local) == m->length) {
+        rc = file_sha256(local, got);
+        if (rc != P2F_OK)
+            return p2f_fail(c, rc, "cannot read %s to verify", local);
+        if (strcmp(got, m->sha256) == 0)
+            return P2F_OK;
+    }
+    remove(local);
+    return p2f_fail(c, P2F_ERR_CHECKSUM, "'%s' failed the checksum%s; it was removed",
+                    file->remote, repair ? " and could not be repaired" : "");
+}
+
 /* ---- One file --------------------------------------------------------- */
 
-static int download_file(p2f_client *c, const remote_file *file,
-                         const char *local, p2f_keypair *kp,
-                         const char *server_pub, uint64_t base, run_state *s)
+static int download_file_meta(p2f_client *c, const remote_file *file,
+                              const char *local, p2f_keypair *kp,
+                              const char *server_pub, uint64_t base,
+                              run_state *s, file_meta *mp, uint8_t key[32],
+                              uint8_t iv[16])
 {
-    uint8_t key[32], iv[16];
-    file_meta meta;
     p2f_resume_plan plan;
     int64_t existing, start, block_start, drop, written = 0;
     int append, hashing = 0, rc, idle;
@@ -422,25 +690,36 @@ static int download_file(p2f_client *c, const remote_file *file,
     s->prog.current = file->remote;
     existing = local_size(local);
 
-    rc = fetch_meta(c, file->remote, kp->pub_b64, &meta, s);
+    rc = fetch_meta(c, file->remote, kp->pub_b64, mp, s);
     if (rc != P2F_OK)
         return rc;
-    if (p2f_unwrap_transfer_key(kp, server_pub, meta.wrapped, key, iv) != P2F_OK)
+    if (p2f_unwrap_transfer_key(kp, server_pub, mp->wrapped, key, iv) != P2F_OK)
         return p2f_fail(c, P2F_ERR_CRYPTO, "key unwrap failed for %s",
                         file->remote);
 
     /* Resume plan. */
-    plan = p2f_plan_resume(existing, meta.length);
+    plan = p2f_plan_resume(existing, mp->length);
+    /* Check a full-size copy before it is trusted (a bad disk write, a copy
+     * cut and padded), and heal one that is too long instead of starting
+     * over. */
+    if (s->opts->verify && mp->sha256[0] && mp->length > 0 &&
+        (plan.skip || (existing > mp->length && !s->opts->no_repair &&
+                       mp->torrent_b64))) {
+        rc = check_and_heal(c, file, local, mp, key, iv, s, 0);
+        if (rc != P2F_OK)
+            return rc;
+        plan.skip = 1;
+    }
     if (plan.skip) {
         struct stat st;
         /* An empty remote file: make sure the local file exists. */
-        if (meta.length == 0 && stat(local, &st) != 0) {
+        if (mp->length == 0 && stat(local, &st) != 0) {
             FILE *e = fopen(local, "wb");
             if (!e)
                 return p2f_fail(c, P2F_ERR_IO, "cannot create %s", local);
             fclose(e);
         }
-        s->prog.bytes_done = base + (uint64_t)meta.length;
+        s->prog.bytes_done = base + (uint64_t)mp->length;
         s->prog.files_done++;
         return report(s) ? P2F_ERR_ABORT : P2F_OK;
     }
@@ -488,7 +767,6 @@ static int download_file(p2f_client *c, const remote_file *file,
         p2f_http_close(&h);
         return p2f_fail(c, P2F_ERR_CRYPTO, "AES init failed");
     }
-    memset(key, 0, sizeof(key));
 
     buf = malloc(IO_BUF);
     f = fopen(local, append ? "ab" : "wb");
@@ -553,15 +831,15 @@ done:
     }
 
     /* A short read means the link dropped. The next try resumes. */
-    if (local_size(local) != meta.length) {
+    if (local_size(local) != mp->length) {
         if (hashing)
             mbedtls_sha256_free(&sha);
         return p2f_fail(c, P2F_ERR_SHORT, "'%s' is short: %lld of %lld bytes",
                         file->remote, (long long)local_size(local),
-                        (long long)meta.length);
+                        (long long)mp->length);
     }
 
-    if (s->opts->verify && meta.sha256[0]) {
+    if (s->opts->verify && mp->sha256[0]) {
         char got[65];
         if (hashing) {
             unsigned char digest[32];
@@ -573,19 +851,35 @@ done:
             if (rc != P2F_OK)
                 return p2f_fail(c, rc, "cannot read %s to verify", local);
         }
-        if (strcmp(got, meta.sha256) != 0) {
-            remove(local);
-            return p2f_fail(c, P2F_ERR_CHECKSUM,
-                            "'%s' failed the checksum; it was removed",
-                            file->remote);
+        if (strcmp(got, mp->sha256) != 0) {
+            /* Wrong somewhere: fetch only the bad pieces again. */
+            rc = check_and_heal(c, file, local, mp, key, iv, s, 1);
+            if (rc != P2F_OK)
+                return rc;
         }
     } else if (hashing) {
         mbedtls_sha256_free(&sha);
     }
 
-    s->prog.bytes_done = base + (uint64_t)meta.length;
+    s->prog.bytes_done = base + (uint64_t)mp->length;
     s->prog.files_done++;
     return report(s) ? P2F_ERR_ABORT : P2F_OK;
+}
+
+static int download_file(p2f_client *c, const remote_file *file,
+                         const char *local, p2f_keypair *kp,
+                         const char *server_pub, uint64_t base, run_state *s)
+{
+    uint8_t key[32], iv[16];
+    file_meta meta;
+    int rc;
+
+    memset(&meta, 0, sizeof(meta));
+    rc = download_file_meta(c, file, local, kp, server_pub, base, s, &meta,
+                            key, iv);
+    memset(key, 0, sizeof(key));
+    free(meta.torrent_b64);
+    return rc;
 }
 
 /* ---- Public entry point ----------------------------------------------- */
@@ -614,7 +908,7 @@ int p2f_download_path(p2f_client *c, const char *remote, const char *local_dir,
                       const p2f_download_opts *opts, char *out_local,
                       size_t out_local_len)
 {
-    static const p2f_download_opts defaults = { NULL, NULL, 1, 60000, 0 };
+    static const p2f_download_opts defaults = { NULL, NULL, 1, 60000, 0, 0 };
     char server_pub[256];
     char remote_clean[1024];
     file_list files = { 0 };

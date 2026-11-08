@@ -2,7 +2,8 @@
  * Command-line client and test tool for p2f-lib.
  *   p2f-cli <base_url> <token> <remote_path> <local_dir> [--abort-at N]
  *           [--abort-preparing] [--prepare-timeout ms] [--ls] [--ca file.pem]
- *           [--dns ip[:port]]
+ *           [--dns ip[:port]] [--no-repair]
+ * With a repair, it prints "repaired N pieces" (the tests read this).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@
 static long long abort_at = -1;
 static int abort_preparing;
 static int saw_preparing;
+static unsigned repaired, verified;
 
 static int on_progress(const p2f_progress *p, void *user)
 {
@@ -26,6 +28,16 @@ static int on_progress(const p2f_progress *p, void *user)
                 (unsigned long long)p->prepare_total);
         return abort_preparing;
     }
+    if (p->repair_phase == P2F_REPAIR_VERIFYING) {
+        verified = p->repair_done;
+        fprintf(stderr, "\rchecking pieces %u/%u   ", p->repair_done, p->repair_total);
+        return 0;
+    }
+    if (p->repair_phase == P2F_REPAIR_FETCHING) {
+        repaired = p->repair_done;
+        fprintf(stderr, "\rrepairing %u/%u pieces   ", p->repair_done, p->repair_total);
+        return 0;
+    }
     fprintf(stderr, "\r%6.2f%%  %llu/%llu  file %d/%d   ",
             p->bytes_total ? 100.0 * (double)p->bytes_done / (double)p->bytes_total : 0.0,
             (unsigned long long)p->bytes_done,
@@ -36,7 +48,7 @@ static int on_progress(const p2f_progress *p, void *user)
 int main(int argc, char **argv)
 {
     p2f_client *c;
-    p2f_download_opts o = { on_progress, NULL, 1, 5000, 0 };
+    p2f_download_opts o = { on_progress, NULL, 1, 5000, 0, 0 };
     char local[1024];
     const char *ca = NULL;
     int rc, i, ls = 0;
@@ -44,7 +56,8 @@ int main(int argc, char **argv)
     if (argc < 5) {
         fprintf(stderr, "usage: %s <base_url> <token> <remote> <local_dir>"
                         " [--abort-at N] [--abort-preparing] [--prepare-timeout ms]"
-                        " [--ls] [--ca file.pem] [--dns ip[:port]]\n", argv[0]);
+                        " [--ls] [--ca file.pem] [--dns ip[:port]]"
+                        " [--no-repair]\n", argv[0]);
         return 2;
     }
     for (i = 5; i < argc; i++) {
@@ -60,6 +73,8 @@ int main(int argc, char **argv)
             ca = argv[++i];
         else if (strcmp(argv[i], "--dns") == 0 && i + 1 < argc)
             p2f_set_dns_server(argv[++i]);
+        else if (strcmp(argv[i], "--no-repair") == 0)
+            o.no_repair = 1;
     }
     if (p2f_client_new(&c, argv[1], argv[2], 5000) != P2F_OK) {
         fprintf(stderr, "bad base url\n");
@@ -80,6 +95,10 @@ int main(int argc, char **argv)
     } else {
         rc = p2f_download_path(c, argv[3], argv[4], &o, local, sizeof(local));
         fprintf(stderr, "\n");
+        if (verified)
+            printf("checked %u pieces\n", verified);
+        if (repaired)
+            printf("repaired %u pieces\n", repaired);
         if (rc == P2F_OK)
             printf("saved to %s\n", local);
     }

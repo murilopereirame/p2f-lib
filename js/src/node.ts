@@ -18,18 +18,23 @@
  *     CTR is seekable, so a whole local file is always a correct prefix of
  *     the plaintext and the resume is safe.
  *   - A finished file is checked against the server's plaintext SHA-256.
+ *     One that fails it is repaired: only its missing or damaged pieces are
+ *     fetched again (repair.ts). A full-size file on disk is checked the
+ *     same way before it is skipped.
  *
  * The remote data is never changed. This client only reads.
  */
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { P2FClient } from "./client.js";
 import { BLOCK_LEN, ClientKeyPair, CtrStream, generateClientKeyPair, initP2F, planResume, Sha256 } from "./core.js";
+import { decodeTorrent, repairFile, webseedFetcher } from "./repair.js";
+import type { RepairProgress, RepairResult, RepairTarget } from "./repair.js";
 import { P2FError } from "./types.js";
-import type { PrepareProgress } from "./types.js";
+import type { PrepareProgress, TorrentMeta } from "./types.js";
 
 export interface Transfer {
   bytesDone: number;
@@ -45,9 +50,16 @@ export interface DownloadOptions {
   /** Abort the whole download (a pause or a shutdown). The bytes on disk are
    * kept and a later call resumes from them. */
   signal?: AbortSignal;
-  /** Check each finished file against the server's plaintext SHA-256.
-   * Default true. */
+  /** Check each finished file against the server's plaintext SHA-256, and
+   * check a full-size file already on disk before it is skipped. Default
+   * true. */
   verify?: boolean;
+  /** When a file fails the checksum, fetch only its missing or damaged
+   * pieces again instead of the whole file. Needs `verify`. Default true. */
+  repair?: boolean;
+  /** Progress of a repair, per file (the path under the local target, or
+   * the file name for a single-file download). */
+  onRepair?: (file: string, progress: RepairProgress) => void;
   /** Destroy a stalled connection after this many ms with no bytes, so the
    * caller's retry can resume it. Default 60000. Zero turns it off. */
   idleTimeoutMs?: number;
@@ -162,6 +174,104 @@ async function fileSha256(target: string): Promise<string> {
   return hash.digestHex();
 }
 
+/** A RepairTarget over a local file. */
+export function nodeFileTarget(file: string): RepairTarget {
+  return {
+    size: () => localSize(file),
+    async read(offset, length) {
+      const fh = await open(file, "r");
+      try {
+        const buf = Buffer.alloc(length);
+        let got = 0;
+        while (got < length) {
+          const { bytesRead } = await fh.read(buf, got, length - got, offset + got);
+          if (bytesRead === 0) break;
+          got += bytesRead;
+        }
+        return buf.subarray(0, got);
+      } finally {
+        await fh.close();
+      }
+    },
+    async write(offset, data) {
+      const fh = await open(file, "r+").catch(async (err: NodeJS.ErrnoException) => {
+        if (err.code !== "ENOENT") throw err;
+        return open(file, "w+");
+      });
+      try {
+        let done = 0;
+        while (done < data.length) {
+          const { bytesWritten } = await fh.write(data, done, data.length - done, offset + done);
+          done += bytesWritten;
+        }
+      } finally {
+        await fh.close();
+      }
+    },
+    async truncate(length) {
+      const fh = await open(file, "r+");
+      try {
+        await fh.truncate(length);
+      } finally {
+        await fh.close();
+      }
+    },
+  };
+}
+
+/** A failure that a later call can get past with the bytes kept: a stop or
+ * a network problem. */
+function keepsBytes(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  if (!(err instanceof P2FError)) return false;
+  return err.status === 0 || err.status === 408 || err.status === 429 || err.status >= 500;
+}
+
+/**
+ * A local file at full size (or longer) is not known to be right: check it
+ * and repair it. `failedSha`: it already failed the SHA-256 check. Returns
+ * the repair result when it is right now. A stop or a network error keeps
+ * the bytes (and throws); any other failure removes the file and throws.
+ */
+async function checkAndHeal(
+  client: P2FClient,
+  file: RemoteFile,
+  local: string,
+  meta: TorrentMeta,
+  key: Uint8Array,
+  iv: Uint8Array,
+  opts: DownloadOptions,
+  failedSha: boolean,
+): Promise<RepairResult | null> {
+  const name = file.relative || path.basename(local);
+  const repair = (opts.repair ?? true) && !!meta.torrentBase64;
+  if (repair) {
+    let result: RepairResult | null = null;
+    try {
+      result = await repairFile(
+        nodeFileTarget(local),
+        decodeTorrent(meta.torrentBase64),
+        key,
+        iv,
+        webseedFetcher(client, file.remote),
+        { signal: opts.signal, onProgress: (p) => opts.onRepair?.(name, p) },
+      );
+    } catch (err) {
+      if (keepsBytes(err, opts.signal)) throw err;
+    }
+    // Every piece right and nothing fetched: the file is right.
+    if (result && result.damaged.length === 0 && !failedSha) return result;
+    if (result && (await fileSha256(local)) === meta.plainSha256) return result;
+  } else if (!failedSha && (await localSize(local)) === meta.length) {
+    if ((await fileSha256(local)) === meta.plainSha256) return null;
+  }
+  await rm(local, { force: true });
+  throw new Error(
+    `the file '${name}' failed the checksum${repair ? " and could not be repaired" : ""}. ` +
+      `It was removed and will be downloaded again.`,
+  );
+}
+
 /** A Transform that runs the core's AES-256-CTR over the stream. */
 class CtrTransform extends Transform {
   constructor(private readonly ctr: CtrStream) {
@@ -226,6 +336,7 @@ async function downloadFile(
 ): Promise<number> {
   const onProgress = opts.onProgress;
   const verify = opts.verify ?? true;
+  const repair = opts.repair ?? true;
   const idleTimeoutMs = opts.idleTimeoutMs ?? 60_000;
 
   const existing = await localSize(local);
@@ -244,7 +355,18 @@ async function downloadFile(
 
   const plan = planResume(existing, length);
 
+  // Check a full-size copy before it is trusted (a bad disk write, a copy
+  // cut and padded), and heal one that is too long instead of starting over.
+  if (
+    verify && meta.plainSha256 && length > 0 &&
+    (plan.skip || (existing > length && repair && !!meta.torrentBase64))
+  ) {
+    await checkAndHeal(client, file, local, meta, key, iv, opts, false);
+    plan.skip = true;
+  }
+
   if (plan.skip) {
+    key.fill(0);
     // An empty remote file: make sure the local file exists (as the C client does).
     if (length === 0) await writeFile(local, new Uint8Array(0), { flag: "a" });
     transfer.bytesDone = base + length;
@@ -302,7 +424,6 @@ async function downloadFile(
 
     const source = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]);
     const decipher = new CtrTransform(new CtrStream(key, iv, blockStart / BLOCK_LEN));
-    key.fill(0);
     const drop = new DropBytes(dropCount);
     const counter = new Counter((written) => {
       bumpIdle();
@@ -330,15 +451,10 @@ async function downloadFile(
 
   if (verify && meta.plainSha256) {
     const got = await fileSha256(local);
-    if (got !== meta.plainSha256) {
-      // The bytes are wrong end to end. Drop them so the next try starts clean.
-      await rm(local, { force: true });
-      throw new Error(
-        `the file '${file.relative || path.basename(local)}' failed the checksum. ` +
-          `It was removed and will be downloaded again.`,
-      );
-    }
+    // Wrong somewhere: fetch only the bad pieces again.
+    if (got !== meta.plainSha256) await checkAndHeal(client, file, local, meta, key, iv, opts, true);
   }
+  key.fill(0);
 
   transfer.bytesDone = base + length;
   transfer.filesDone += 1;

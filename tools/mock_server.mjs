@@ -13,6 +13,11 @@
 //      TORRENT_FAIL=a,b,...  the first /api/torrent requests fail, in order:
 //                     drop (close the connection), 404html (a proxy page),
 //                     404json (the server's own 404), 503
+//      PIECE_LEN=N    torrent piece length (default 262144)
+//      RANGE_LOG=file append each /api/raw Range header (or "-") to file
+//      NO_TORRENT=1   send no torrentBase64 (an old server: no repair)
+//      CORRUPT_RANGES=N  the first N bounded range answers have one byte
+//                     flipped (bad data on the wire)
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
@@ -27,16 +32,40 @@ const prepareMs = Number(process.env.PREPARE_MS ?? 0);
 const oldServer = process.env.OLD_SERVER === "1";
 const torrentFail = (process.env.TORRENT_FAIL ?? "").split(",").filter(Boolean);
 const prepareStart = new Map(); // path -> ms
+const pieceLen = Number(process.env.PIECE_LEN ?? 262144);
+const rangeLog = process.env.RANGE_LOG;
+const noTorrent = process.env.NO_TORRENT === "1";
+let corruptRanges = Number(process.env.CORRUPT_RANGES ?? 0);
 
 const server = crypto.createECDH("prime256v1");
 server.generateKeys();
 const serverPub = server.getPublicKey().toString("base64");
 const fileKeys = new Map(); // path -> { key, iv, sha }
 
+// A single-file torrent over the ciphertext, like the real server's.
+function bstr(b) { return Buffer.concat([Buffer.from(`${b.length}:`), b]); }
+function makeTorrent(name, cipher) {
+  const hashes = [];
+  for (let i = 0; i < cipher.length; i += pieceLen) {
+    hashes.push(crypto.createHash("sha1").update(cipher.subarray(i, i + pieceLen)).digest());
+  }
+  return Buffer.concat([
+    Buffer.from("d8:announce0:4:info"),
+    Buffer.from(`d6:lengthi${cipher.length}e4:name`), bstr(Buffer.from(name)),
+    Buffer.from(`12:piece lengthi${pieceLen}e6:pieces`), bstr(Buffer.concat(hashes)),
+    Buffer.from("7:privatei1eee"),
+  ]);
+}
+
 function keysFor(rel, abs) {
   if (!fileKeys.has(rel)) {
-    const sha = crypto.createHash("sha256").update(fs.readFileSync(abs)).digest("hex");
-    fileKeys.set(rel, { key: crypto.randomBytes(32), iv: crypto.randomBytes(16), sha });
+    const plain = fs.readFileSync(abs);
+    const sha = crypto.createHash("sha256").update(plain).digest("hex");
+    const key = crypto.randomBytes(32), iv = crypto.randomBytes(16);
+    const c = crypto.createCipheriv("aes-256-ctr", key, iv);
+    const cipher = Buffer.concat([c.update(plain), c.final()]);
+    const torrent = makeTorrent(path.basename(abs), cipher).toString("base64");
+    fileKeys.set(rel, { key, iv, sha, torrent });
   }
   return fileKeys.get(rel);
 }
@@ -121,27 +150,41 @@ const handler = (req, res) => {
     }
     const k = keysFor(rel, abs);
     return json(res, 200, { name: path.basename(abs), length: st.size, infoHash: "x", pieceLength: 16384,
-      announce: [], webseed: "", magnet: "", torrentBase64: "",
+      announce: [], webseed: "", magnet: "", torrentBase64: noTorrent ? "" : k.torrent,
       encKeyWrapped: wrap(url.searchParams.get("ck"), Buffer.concat([k.key, k.iv])), plainSha256: k.sha });
   }
   if (url.pathname === "/api/raw") {
     const k = keysFor(rel, abs);
-    let start = 0;
-    const m = /bytes=(\d+)-/.exec(req.headers.range ?? "");
-    if (m && !ignoreRange) start = Number(m[1]);
+    if (rangeLog) fs.appendFileSync(rangeLog, `${req.headers.range ?? "-"}\n`);
+    let start = 0, end = st.size - 1;
+    const m = /bytes=(\d+)-(\d*)/.exec(req.headers.range ?? "");
+    if (m && !ignoreRange) {
+      start = Number(m[1]);
+      if (m[2]) end = Math.min(Number(m[2]), st.size - 1);
+    }
+    const bounded = !!(m && m[2] && !ignoreRange);
+    if (bounded && start > end) {
+      res.writeHead(416, { "Content-Range": `bytes */${st.size}` });
+      return res.end();
+    }
+    const corrupt = bounded && corruptRanges > 0;
+    if (corrupt) corruptRanges--;
     const blockStart = start - (start % 16);
     const drop = start - blockStart;
     const cipher = crypto.createCipheriv("aes-256-ctr", k.key, ctrCounter(k.iv, blockStart / 16));
-    const headers = { "Content-Type": "application/octet-stream", "Content-Length": st.size - start, "Accept-Ranges": "bytes" };
-    if (start > 0) headers["Content-Range"] = `bytes ${start}-${st.size - 1}/${st.size}`;
-    res.writeHead(start > 0 ? 206 : 200, headers);
+    const ranged = start > 0 || bounded;
+    const headers = { "Content-Type": "application/octet-stream", "Content-Length": end - start + 1, "Accept-Ranges": "bytes" };
+    if (ranged) headers["Content-Range"] = `bytes ${start}-${end}/${st.size}`;
+    res.writeHead(ranged ? 206 : 200, headers);
     let sent = 0, dropLeft = drop;
     const cut = cutAfter >= 0 && !cutDone;
     if (cut) cutDone = true;
-    const rs = fs.createReadStream(abs, { start: blockStart });
+    const rs = fs.createReadStream(abs, end >= blockStart ? { start: blockStart, end } : { start: blockStart });
+    let flipped = false;
     rs.on("data", (chunk) => {
       let out = cipher.update(chunk);
       if (dropLeft > 0) { const d = Math.min(dropLeft, out.length); out = out.subarray(d); dropLeft -= d; }
+      if (corrupt && !flipped && out.length > 0) { out = Buffer.from(out); out[0] ^= 0xff; flipped = true; }
       if (cut && sent + out.length > cutAfter) {
         res.write(out.subarray(0, cutAfter - sent));
         rs.destroy();

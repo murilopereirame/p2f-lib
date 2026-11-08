@@ -24,6 +24,15 @@ What the library does:
 - **Decrypted end to end.** Files are AES-256-CTR ciphertext on the wire. The
   key is ECDH-wrapped per transfer (P-256 / HKDF-SHA256 / AES-256-GCM).
 - **Verified.** A finished file is checked against the server's plaintext SHA-256.
+- **Self-repairing.** A file that fails the checksum is not downloaded again
+  from scratch. Each piece of the local copy is encrypted again (CTR is
+  seekable) and checked against the torrent's SHA-1 piece hashes; only the
+  missing or damaged pieces are fetched again, with bounded `Range`
+  requests, checked against their hash, decrypted and written in place.
+  Data that fails its hash is never written. A full-size copy on disk is
+  checked the same way before it is skipped, and a copy that is too long is
+  trimmed. The pure parts (torrent parser, piece check) are
+  `src/p2f_repair.c`, in every build.
 - **Patient with big files.** The server reads and hashes a whole file before
   it can describe it; for a big file that takes minutes the first time. The
   client asks with `async=1`, the server answers `202` with its progress, and
@@ -51,7 +60,7 @@ What the library does:
 ```sh
 scripts/fetch_deps.sh                 # mbedTLS 3.6.2, cJSON 1.7.19 -> third_party/
 make                                  # desktop: build/host/libp2f.a + p2f-cli
-make test                             # desktop build + 35 end-to-end tests (Node 20+, python3-cryptography)
+make test                             # desktop build + 45 end-to-end tests (Node 20+, python3-cryptography)
 
 scripts/install_toolchains.sh ps4 wasm android   # OpenOrbis v0.5.2, wasi-sdk 25, NDK r27c -> toolchains/
 export OO_PS4_TOOLCHAIN=$PWD/toolchains/PS4Toolchain WASI_SDK_PATH=$PWD/toolchains/wasi-sdk
@@ -96,15 +105,21 @@ p2f_client *c;
 p2f_client_new(&c, "https://files.example.com", "p2f_...", 0);
 p2f_client_set_ca_file(c, "/data/p2f/ca.pem");   /* optional */
 p2f_download_opts o = { on_progress, user, 1 /* verify */, 60000 /* idle ms */,
-                        0 /* prepare timeout: wait until stopped */ };
+                        0 /* prepare timeout: wait until stopped */,
+                        0 /* no_repair: 0 = repair damaged files */ };
 int rc = p2f_download_path(c, "movies/Film.2024", "/data/p2f/downloads", &o, NULL, 0);
 if (p2f_is_retryable(rc)) { /* call again: it resumes */ }
 p2f_client_free(c);
 ```
 
 While the server prepares a file, the progress callback gets
-`p->preparing == 1` with `prepare_done` / `prepare_total`. Return non-zero
-from the callback to stop.
+`p->preparing == 1` with `prepare_done` / `prepare_total`. During a repair
+it gets `p->repair_phase` (`P2F_REPAIR_VERIFYING`, then
+`P2F_REPAIR_FETCHING`) with `repair_done` / `repair_total` in pieces. Return
+non-zero from the callback to stop; a stop or a network error during a
+repair keeps the file, and the next call checks it again.
+`P2F_ERR_CHECKSUM` now means the repair could not fix the file (or
+`no_repair` is set, or the server sent no torrent); the file was removed.
 
 ## JavaScript usage
 
@@ -116,8 +131,16 @@ const client = new P2FClient({ baseUrl: "http://10.0.0.1:8000", token: process.e
 const local = await downloadPath(client, "movies/Film.2024", "./downloads", {
   onProgress: (t) => console.log(`${t.bytesDone}/${t.bytesTotal}`),
   onPreparing: (p) => console.log(`server preparing ${p.remote}: ${p.bytesDone}/${p.bytesTotal}`),
+  onRepair: (file, p) => console.log(`repair ${file}: ${p.phase} ${p.done}/${p.total}`),
+  // repair: false  -> remove a bad file instead (the next call downloads it)
 });
 ```
+
+`repairFile(target, torrent, key, iv, fetchRange)` is exported on its own
+for apps with their own storage: `target` is a small random-access
+interface (`size`, `read`, `write`, `truncate`), so a browser app can heal a
+file in OPFS. `nodeFileTarget(path)` (in `p2f-lib/node`) is the one for
+files on disk, and `webseedFetcher(client, remote)` fetches pieces.
 
 The lower-level pieces (`initP2F`, `generateClientKeyPair`, `CtrStream`,
 `Sha256`, `planResume`, `retryDelayMs`, `waitForTorrentMeta`) are exported

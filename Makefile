@@ -23,7 +23,7 @@ MBEDTLS  := third_party/mbedtls
 CJSON    := third_party/cJSON
 
 CORE_SRC := src/p2f_client.c src/p2f_http.c src/p2f_crypto.c src/p2f_policy.c \
-            src/p2f_download.c src/p2f_tls.c src/p2f_dns.c src/ca_bundle.c \
+            src/p2f_download.c src/p2f_repair.c src/p2f_tls.c src/p2f_dns.c src/ca_bundle.c \
             $(CJSON)/cJSON.c
 MBED_SRC := $(wildcard $(MBEDTLS)/library/*.c)
 DEFS     := -DMBEDTLS_CONFIG_FILE='"p2f_mbedtls_config.h"' -DP2F_VERSION='"$(VERSION)"'
@@ -94,8 +94,9 @@ WASM_CC    = $(WASI_SDK_PATH)/bin/clang
 WASM_CFLAGS = --target=wasm32-wasip1 -O2 -flto -Iinclude -Isrc -I$(MBEDTLS)/include \
               -DMBEDTLS_CONFIG_FILE='"p2f_mbedtls_config_wasm.h"' -DP2F_VERSION='"$(VERSION)"'
 WASM_MBED := aes gcm cipher cipher_wrap ecp ecp_curves ecdh bignum bignum_core \
-             hkdf md sha256 base64 platform_util constant_time
-WASM_SRC  := src/p2f_crypto.c src/p2f_policy.c src/platform/wasm.c src/wasm/exports.c \
+             hkdf md sha1 sha256 base64 platform_util constant_time
+WASM_SRC  := src/p2f_crypto.c src/p2f_policy.c src/p2f_repair.c src/platform/wasm.c \
+             src/wasm/exports.c \
              $(patsubst %,$(MBEDTLS)/library/%.c,$(WASM_MBED))
 WASM_OBJ  := $(patsubst %.c,$(WASM)/%.o,$(WASM_SRC))
 

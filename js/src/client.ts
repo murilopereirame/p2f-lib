@@ -42,6 +42,8 @@ export interface TorrentMetaOptions {
 export interface RawRangeOptions {
   /** The first byte to fetch. Omit for the whole file. */
   start?: number;
+  /** The last byte to fetch (inclusive). Omit for "to the end". */
+  end?: number;
   /** Abort the stream (a pause, a stall watchdog, a shutdown). */
   signal?: AbortSignal;
 }
@@ -252,7 +254,9 @@ export class P2FClient {
    */
   async rawRange(path: string, opts: RawRangeOptions = {}): Promise<Response> {
     const extra: Record<string, string> = {};
-    if (opts.start !== undefined && opts.start > 0) extra.Range = `bytes=${opts.start}-`;
+    const start = opts.start ?? 0;
+    if (opts.end !== undefined && opts.end >= start) extra.Range = `bytes=${start}-${opts.end}`;
+    else if (start > 0) extra.Range = `bytes=${start}-`;
     let res: Response;
     try {
       res = await this.fetchImpl(this.url("/api/raw", { path }), {
